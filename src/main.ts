@@ -102,7 +102,7 @@ camera.add(criticalFlashPlane);
 
 const criticalFlashState = {
     startedAt: -Infinity,
-    duration: 0.34,
+    duration: 0.17,
     worldPoint: undefined as THREE.Vector3 | undefined
 };
 
@@ -193,6 +193,7 @@ const endAim = (e: PointerEvent) => {
     dragZone.classList.remove('active');
     dragZone.releasePointerCapture(e.pointerId);
     if (document.exitPointerLock) document.exitPointerLock();
+    handleTutorialAimComplete();
 };
 
 dragZone.addEventListener('pointerup', endAim);
@@ -475,6 +476,113 @@ wallMesh.position.y = BOWL_MAX_HEIGHT;
 arenaGroup.add(wallMesh);
 
 
+type TVortexUniforms = {
+    uTime: { value: number };
+    uDirection: { value: number };
+    uIntensity: { value: number };
+    uExpansion: { value: number };
+    uTint: { value: THREE.Color };
+};
+
+function createBeyVortexMaterial(tint: number): THREE.ShaderMaterial {
+    const uniforms: TVortexUniforms = {
+        uTime: { value: 0 },
+        uDirection: { value: 1 },
+        uIntensity: { value: 0.46 },
+        uExpansion: { value: 1 },
+        uTint: { value: new THREE.Color(tint) }
+    };
+
+    return new THREE.ShaderMaterial({
+        uniforms,
+        vertexShader: `
+            uniform float uExpansion;
+            varying vec2 vUv;
+            varying vec3 vNormal;
+            varying vec3 vLocalPosition;
+
+            void main() {
+                vUv = uv;
+                vNormal = normalize(normalMatrix * normal);
+                vec3 transformed = position;
+                float currentFlare = mix(1.0, 2.0, uv.y);
+                float targetFlare = mix(1.0, 1.0 + uExpansion, uv.y);
+                transformed.xz *= targetFlare / currentFlare;
+                vLocalPosition = transformed;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(transformed, 1.0);
+            }
+        `,
+        fragmentShader: `
+            uniform float uTime;
+            uniform float uDirection;
+            uniform float uIntensity;
+            uniform vec3 uTint;
+            varying vec2 vUv;
+            varying vec3 vNormal;
+            varying vec3 vLocalPosition;
+
+            void main() {
+                float angle = atan(vLocalPosition.z, vLocalPosition.x);
+                float lift = vUv.y;
+                float outward = lift - uTime * 0.18;
+                float diagonal = sin(angle * 4.0 * uDirection + outward * 18.0);
+                float crossWave = sin(angle * -7.0 * uDirection + outward * 28.0 - uTime * 0.22);
+                float softNoise = sin(angle * 11.0 * uDirection + outward * 9.0);
+                float cloud = smoothstep(-0.42, 0.78, diagonal * 0.62 + crossWave * 0.38);
+                float ribbons = smoothstep(0.64, 0.98, abs(sin(angle * 3.0 * uDirection + outward * 13.0)));
+                cloud = mix(cloud, smoothstep(-0.25, 0.9, softNoise), 0.18);
+                float baseFade = smoothstep(0.0, 0.08, lift);
+                float topVanish = pow(1.0 - smoothstep(0.36, 1.0, lift), 1.55);
+                float verticalFade = baseFade * topVanish;
+                float rim = pow(1.0 - abs(dot(normalize(vNormal), vec3(0.0, 0.0, 1.0))), 1.8);
+                float alpha = (cloud * 0.22 + ribbons * 0.34 + rim * 0.18) * verticalFade * uIntensity;
+                vec3 color = mix(vec3(1.0), uTint, 0.68 + cloud * 0.24);
+                gl_FragColor = vec4(color, alpha);
+            }
+        `,
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending
+    });
+}
+
+function setBeyVortexColor(mesh: THREE.Object3D, color: number) {
+    const uniforms = mesh.userData.vortexUniforms as TVortexUniforms | undefined;
+    if (uniforms?.uTint.value instanceof THREE.Color) {
+        uniforms.uTint.value.setHex(color);
+    }
+}
+
+function updateBeyVortex(mesh: THREE.Object3D, time: number, speed = 0, rpm = 0, maxRpm = 1000, direction = 1, tint?: number) {
+    const uniforms = mesh.userData.vortexUniforms as TVortexUniforms | undefined;
+    if (!uniforms) return;
+    if (typeof tint === 'number') {
+        uniforms.uTint.value.setHex(tint);
+    }
+    const rpmRatio = THREE.MathUtils.clamp(rpm / Math.max(1, maxRpm), 0, 1);
+    uniforms.uTime.value = time;
+    uniforms.uDirection.value = direction;
+    uniforms.uExpansion.value = 0.42 + rpmRatio * 0.58;
+    uniforms.uIntensity.value = THREE.MathUtils.clamp(0.24 + speed * 0.014 + rpmRatio * 0.28, 0.24, 0.78) * 0.25;
+
+    const vortex = mesh.userData.vortex as THREE.Object3D | undefined;
+    if (vortex) {
+        const lastTime = typeof mesh.userData.vortexLastTime === 'number' ? mesh.userData.vortexLastTime : time;
+        const delta = Math.max(0, Math.min(time - lastTime, 0.05));
+        const rpmRadiansPerSecond = (Math.max(0, rpm) / 60) * Math.PI * 2;
+        mesh.userData.vortexAngle = (mesh.userData.vortexAngle || 0) + rpmRadiansPerSecond * delta * 0.22 * direction;
+        mesh.userData.vortexLastTime = time;
+
+        const parentCancel = mesh.quaternion.clone().invert();
+        const ownRotation = new THREE.Quaternion().setFromAxisAngle(
+            new THREE.Vector3(0, 1, 0),
+            mesh.userData.vortexAngle
+        );
+        vortex.quaternion.copy(parentCancel).multiply(ownRotation);
+    }
+}
+
 
 
 
@@ -535,6 +643,20 @@ function createBeybladeMesh(stats: BeybladeStats): { mesh: THREE.Group, tiltGrou
     wheel.position.y = 5;
     wheel.rotation.x = Math.PI / 2; // Extrude creates on XY plane
     spinGroup.add(wheel);
+
+    const vortexMat = createBeyVortexMaterial(stats.trailColor || stats.boltColor || 0xffffff);
+    const vortex = new THREE.Mesh(
+        new THREE.CylinderGeometry(BEYBLADE_RADIUS * 2.0, BEYBLADE_RADIUS, 5, 96, 16, true),
+        vortexMat
+    );
+    vortex.name = 'bey-air-vortex';
+    vortex.position.y = 7;
+    vortex.scale.setScalar(stats.beyScale || 1.0);
+    vortex.renderOrder = 4;
+    vortex.frustumCulled = false;
+    mesh.add(vortex);
+    mesh.userData.vortex = vortex;
+    mesh.userData.vortexUniforms = vortexMat.uniforms;
 
     // 2. Clear Wheel / Energy Ring - Rounded
     const ringRadius = BEYBLADE_RADIUS * (stats.ringRadiusFactor || 0.75);
@@ -638,25 +760,68 @@ function createBeybladeMesh(stats: BeybladeStats): { mesh: THREE.Group, tiltGrou
 
 // Trail System
 class TrailSystem {
-    mesh: THREE.Line;
+    mesh: THREE.Mesh;
     positions: number[] = [];
     maxPoints = 50;
     geometry: THREE.BufferGeometry;
+    width = 8;
 
     constructor(color: number, scene: THREE.Scene) {
         this.geometry = new THREE.BufferGeometry();
-        // Initialize with default position
-        const posArray = new Float32Array(this.maxPoints * 3);
-        this.geometry.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+        const posArray = new Float32Array(this.maxPoints * 2 * 3);
+        const alphaArray = new Float32Array(this.maxPoints * 2);
+        const indices: number[] = [];
 
-        const material = new THREE.LineBasicMaterial({
-            color: color,
-            linewidth: 1,
+        for (let i = 0; i < this.maxPoints - 1; i++) {
+            const a = i * 2;
+            const b = a + 1;
+            const c = a + 2;
+            const d = a + 3;
+            indices.push(a, c, b, b, c, d);
+        }
+
+        this.geometry.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+        this.geometry.setAttribute('aAlpha', new THREE.BufferAttribute(alphaArray, 1));
+        this.geometry.setIndex(indices);
+
+        const material = new THREE.ShaderMaterial({
+            uniforms: {
+                uColor: { value: new THREE.Color(color) }
+            },
+            vertexShader: `
+                attribute float aAlpha;
+                varying float vAlpha;
+
+                void main() {
+                    vAlpha = aAlpha;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 uColor;
+                varying float vAlpha;
+
+                void main() {
+                    gl_FragColor = vec4(uColor, vAlpha * 0.62);
+                }
+            `,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+            side: THREE.DoubleSide
         });
 
-        this.mesh = new THREE.Line(this.geometry, material);
+        this.mesh = new THREE.Mesh(this.geometry, material);
         this.mesh.frustumCulled = false;
         scene.add(this.mesh);
+    }
+
+    setColor(color: number) {
+        const material = this.mesh.material as THREE.ShaderMaterial;
+        const colorUniform = material.uniforms.uColor;
+        if (colorUniform?.value instanceof THREE.Color) {
+            colorUniform.value.setHex(color);
+        }
     }
 
     update(x: number, y: number, z: number) {
@@ -666,31 +831,50 @@ class TrailSystem {
         }
 
         const positionAttribute = this.geometry.attributes.position as THREE.BufferAttribute;
+        const alphaAttribute = this.geometry.attributes.aAlpha as THREE.BufferAttribute;
         const count = this.positions.length / 3;
 
-        for (let i = 0; i < count; i++) {
-            positionAttribute.setXYZ(i, this.positions[i * 3], this.positions[i * 3 + 1], this.positions[i * 3 + 2]);
-        }
+        for (let i = 0; i < this.maxPoints; i++) {
+            const sourceIndex = Math.min(i, Math.max(count - 1, 0));
+            const currentX = this.positions[sourceIndex * 3] ?? x;
+            const currentY = this.positions[sourceIndex * 3 + 1] ?? y;
+            const currentZ = this.positions[sourceIndex * 3 + 2] ?? z;
+            const prevIndex = Math.max(sourceIndex - 1, 0);
+            const nextIndex = Math.min(sourceIndex + 1, Math.max(count - 1, 0));
+            const prevX = this.positions[prevIndex * 3] ?? currentX;
+            const prevZ = this.positions[prevIndex * 3 + 2] ?? currentZ;
+            const nextX = this.positions[nextIndex * 3] ?? currentX;
+            const nextZ = this.positions[nextIndex * 3 + 2] ?? currentZ;
+            const dx = nextX - prevX;
+            const dz = nextZ - prevZ;
+            const length = Math.max(Math.hypot(dx, dz), 0.001);
+            const perpX = -dz / length;
+            const perpZ = dx / length;
+            const t = count > 1 && i < count ? i / (count - 1) : 0;
+            const fade = i < count ? Math.pow(t, 1.35) : 0;
+            const halfWidth = this.width * (0.18 + fade * 0.82) * 0.5;
+            const vertexIndex = i * 2;
 
-        // Fill rest with last point to hide
-        const lastX = this.positions[this.positions.length - 3] || x;
-        const lastY = this.positions[this.positions.length - 2] || y;
-        const lastZ = this.positions[this.positions.length - 1] || z;
-
-        for (let i = count; i < this.maxPoints; i++) {
-            positionAttribute.setXYZ(i, lastX, lastY, lastZ);
+            positionAttribute.setXYZ(vertexIndex, currentX + perpX * halfWidth, currentY, currentZ + perpZ * halfWidth);
+            positionAttribute.setXYZ(vertexIndex + 1, currentX - perpX * halfWidth, currentY, currentZ - perpZ * halfWidth);
+            alphaAttribute.setX(vertexIndex, fade);
+            alphaAttribute.setX(vertexIndex + 1, fade);
         }
 
         positionAttribute.needsUpdate = true;
+        alphaAttribute.needsUpdate = true;
     }
 
     clear() {
         this.positions = [];
         const positionAttribute = this.geometry.attributes.position as THREE.BufferAttribute;
-        for (let i = 0; i < this.maxPoints; i++) {
+        const alphaAttribute = this.geometry.attributes.aAlpha as THREE.BufferAttribute;
+        for (let i = 0; i < this.maxPoints * 2; i++) {
             positionAttribute.setXYZ(i, 0, 0, 0);
+            alphaAttribute.setX(i, 0);
         }
         positionAttribute.needsUpdate = true;
+        alphaAttribute.needsUpdate = true;
     }
 }
 // --- Game Logic ---
@@ -737,6 +921,9 @@ interface BeybladeStats {
     dragFactor: number;
 }
 
+type TMatcapPart = keyof NonNullable<BeybladeStats['partMatcaps']>;
+const MATCAP_PART_KEYS: TMatcapPart[] = ['wheel', 'ring', 'bolt', 'spinTrack', 'tip'];
+
 interface GameEntity {
     body: Matter.Body;
     mesh: THREE.Object3D;
@@ -761,9 +948,37 @@ const CRIT_SPEED_THRESHOLD = 20;
 const BARRIER_DAMAGE = 20; // Self-damage when hitting walls
 const DIVE_BOOST_FORCE = 0.00012;
 
+type TMatchCounterSide = {
+    criticalHits: number;
+    wallDings: number;
+};
+
+type TMatchCounters = {
+    player: TMatchCounterSide;
+    enemy: TMatchCounterSide;
+};
+
+const matchCounters: TMatchCounters = {
+    player: { criticalHits: 0, wallDings: 0 },
+    enemy: { criticalHits: 0, wallDings: 0 }
+};
+
+function resetMatchCounters() {
+    matchCounters.player.criticalHits = 0;
+    matchCounters.player.wallDings = 0;
+    matchCounters.enemy.criticalHits = 0;
+    matchCounters.enemy.wallDings = 0;
+}
+
+function getMatchCounterSide(entity: GameEntity): TMatchCounterSide | null {
+    if (entity === player) return matchCounters.player;
+    if (entity === enemy) return matchCounters.enemy;
+    return null;
+}
 
 
-const DISH_LOW = 1;
+
+const DISH_LOW = 1.5;
 const DISH_HIGH = 6;
 
 const CURL_LOW = 1;
@@ -785,134 +1000,62 @@ const PATTERNS: PhysicsPattern[] = [
 let currentPatternIndex = 0;
 let cpuPatternIndex = 0;
 
-type TGameSpeedId = 'training' | 'arcade' | 'overdrive';
+type TGameSpeedId = 'tutorial' | 'normal' | 'insane';
 
 const GAME_SPEEDS: Record<TGameSpeedId, { label: string, multiplier: number, copy: string }> = {
-    training: { label: 'Training', multiplier: 0.51, copy: 'Slow lesson pace' },
-    arcade: { label: 'Arcade', multiplier: 0.75, copy: 'Balanced match speed' },
-    overdrive: { label: 'Overdrive', multiplier: 0.96, copy: 'Faster impacts' }
+    tutorial: { label: 'Tutorial', multiplier: 0.25, copy: 'Slow lesson pace' },
+    normal: { label: 'Normal', multiplier: 0.5, copy: 'Standard match speed' },
+    insane: { label: 'Insane', multiplier: 0.75, copy: 'Maximum impact speed' }
 };
 
-let currentGameSpeed: TGameSpeedId = 'training';
-let tutorialComplete = localStorage.getItem('bblade_tutorial_complete') === 'true';
+function isGameSpeedId(value: string | null): value is TGameSpeedId {
+    return value === 'tutorial' || value === 'normal' || value === 'insane';
+}
+
+function normalizeGameSpeedId(value: string | null): TGameSpeedId {
+    if (isGameSpeedId(value)) return value;
+    if (value === 'speed2') return 'insane';
+    return 'normal';
+}
+
+const savedGameSpeed = localStorage.getItem('bblade_game_speed') || 'normal';
+const savedMasterVolume = Number(localStorage.getItem('bblade_master_volume'));
+let currentGameSpeed: TGameSpeedId = normalizeGameSpeedId(savedGameSpeed);
+let masterVolume = Number.isFinite(savedMasterVolume) ? THREE.MathUtils.clamp(savedMasterVolume, 0, 1) : 0.72;
+let flashesEnabled = localStorage.getItem('bblade_flashes_enabled') !== 'false';
 let cpuNextDiveSwitchAt = 0;
 
 // --- Matcap Resources ---
-const MATCAP_ROOT = 'https://raw.githubusercontent.com/nidorx/matcaps/master/';
-let MATCAP_LIBRARY: { name: string, file: string, category: string, thumb: string }[] = [
-    {
-        name: 'Ceramic',
-        file: MATCAP_ROOT + '256/D5D5D5_929292_ACACAC_B4B4B4-256px.png',
-        category: 'Ceramic',
-        thumb: MATCAP_ROOT + '64/D5D5D5_929292_ACACAC_B4B4B4-64px.png'
-    }
-];
-
-// Helper: Hex to HSL for categorization
-function getMatcapCategory(filename: string): string {
-    if (!filename.endsWith('.png')) return 'Other';
-    // Remove resolution suffix if present (e.g. -256px)
-    const raw = filename.replace(/-[0-9]+px\.png$/, '.png').replace('.png', '');
-    const parts = raw.split('_');
-    if (parts.length < 4) return 'Other';
-
-    let r = 0, g = 0, b = 0;
-    parts.forEach(hex => {
-        const bigint = parseInt(hex, 16);
-        r += (bigint >> 16) & 255;
-        g += (bigint >> 8) & 255;
-        b += bigint & 255;
-    });
-    r /= parts.length; g /= parts.length; b /= parts.length;
-
-    // RGB to HSL
-    r /= 255, g /= 255, b /= 255;
-    const max = Math.max(r, g, b), min = Math.min(r, g, b);
-    let h = 0, s = 0, l = (max + min) / 2;
-
-    if (max !== min) {
-        const d = max - min;
-        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-        switch (max) {
-            case r: h = (g - b) / d + (g < b ? 6 : 0); break;
-            case g: h = (b - r) / d + 2; break;
-            case b: h = (r - g) / d + 4; break;
-        }
-        h /= 6;
-    }
-    const hDeg = h * 360;
-
-    if (s < 0.15) {
-        if (l < 0.2) return 'Dark';
-        if (l > 0.8) return 'Ceramic';
-        return 'Silver';
-    } else {
-        if (hDeg >= 30 && hDeg < 60 && l > 0.4) return 'Gold/Bronze';
-        if (hDeg >= 0 && hDeg < 30) return 'Red';
-        if (hDeg >= 330 && hDeg <= 360) return 'Red';
-        if (hDeg >= 60 && hDeg < 150) return 'Green';
-        if (hDeg >= 150 && hDeg < 260) return 'Cyan/Blue';
-        if (hDeg >= 260 && hDeg < 330) return 'Purple';
-        return 'Color';
-    }
-}
-
-async function loadMatcapLibrary() {
-    try {
-        const response = await fetch('/matcaps_library.json');
-        const data = await response.json();
-        MATCAP_LIBRARY = data
-            .filter((f: any) => f.name.endsWith('.png'))
-            .map((f: any) => {
-                // Determine logic to swap resolution
-                // Original name is 1024/Hex.png or just Hex.png inside the json "name" field
-                // The json "name" from the raw file list is just the filename usually?
-                // Let's check the json structure you viewed earlier.
-                // It has "path": "1024/..." and "name": "..." 
-
-                const baseName = f.name; // e.g. "0404E8.....png"
-                const nameWithoutExt = baseName.replace('.png', '');
-
-                // Nidorx naming convention for other sizes:
-                // 1024/NAME.png
-                // 256/NAME-256px.png
-                // 64/NAME-64px.png
-
-                return {
-                    name: baseName,
-                    file: `${MATCAP_ROOT}256/${nameWithoutExt}-256px.png`,
-                    category: getMatcapCategory(baseName),
-                    thumb: `${MATCAP_ROOT}64/${nameWithoutExt}-64px.png`
-                };
-            });
-        console.log(`Loaded ${MATCAP_LIBRARY.length} matcaps.`);
-    } catch (e) {
-        console.error('Failed to load matcap library:', e);
-        // Keep default
-    }
-}
-
-// Start loading immediately
-loadMatcapLibrary();
-
+const ALLOWED_MATCAP_URLS = [
+    'https://raw.githubusercontent.com/nidorx/matcaps/master/128/28292A_D3DAE5_A3ACB8_818183-128px.png',
+    'https://raw.githubusercontent.com/nidorx/matcaps/master/128/2A2A2A_B3B3B3_6D6D6D_848C8C-128px.png',
+    'https://raw.githubusercontent.com/nidorx/matcaps/master/128/3F4441_D1D7D6_888F87_A2ADA1-128px.png',
+    'https://raw.githubusercontent.com/nidorx/matcaps/master/128/394641_B1A67E_75BEBE_7D7256-128px.png',
+    'https://raw.githubusercontent.com/nidorx/matcaps/master/128/313131_BBBBBB_878787_A3A4A4-128px.png',
+    'https://raw.githubusercontent.com/nidorx/matcaps/master/128/353535_CFCFCF_828282_A4A4A4-128px.png'
+] as const;
+const ALLOWED_MATCAP_SET = new Set<string>(ALLOWED_MATCAP_URLS);
+const MATCAP_LIBRARY: { name: string, file: string, category: string, thumb: string }[] = ALLOWED_MATCAP_URLS.map((url, index) => ({
+    name: decodeURIComponent(url.split('/').pop() || `matcap-${index + 1}`),
+    file: url,
+    category: `Matcap ${index + 1}`,
+    thumb: url
+}));
+const defaultMatcapUrl = ALLOWED_MATCAP_URLS[0];
 const textureCache: Record<string, THREE.Texture> = {};
-const defaultMatcapUrl = 'https://raw.githubusercontent.com/nidorx/matcaps/master/256/D5D5D5_929292_ACACAC_B4B4B4-256px.png';
 const textureLoader = new THREE.TextureLoader();
-const matcapTexture = textureLoader.load(defaultMatcapUrl);
 
 function getContrastMatcapUrl(url: string | undefined): string | undefined {
     if (!url) return url;
-    const filename = decodeURIComponent(url.split('/').pop() || '').replace(/-[0-9]+px\.png$/, '.png');
-    return getMatcapCategory(filename) === 'Dark' ? defaultMatcapUrl : url;
+    return ALLOWED_MATCAP_SET.has(url) ? url : defaultMatcapUrl;
 }
 
 function getMatcapTexture(url: string | undefined): THREE.Texture {
-    if (!url) return matcapTexture; // Default ceramic
-
-    if (!textureCache[url]) {
-        textureCache[url] = textureLoader.load(url);
+    const safeUrl = getContrastMatcapUrl(url) || defaultMatcapUrl;
+    if (!textureCache[safeUrl]) {
+        textureCache[safeUrl] = textureLoader.load(safeUrl);
     }
-    return textureCache[url];
+    return textureCache[safeUrl];
 }
 
 
@@ -935,32 +1078,27 @@ type TRawBeyPreset = {
     stats: Record<string, unknown>;
 };
 
-function matcapUrl(name: string) {
-    const nameWithoutExt = name.replace('.png', '');
-    return `${MATCAP_ROOT}256/${nameWithoutExt}-256px.png`;
-}
-
 const PRESET_MATCAP_SETS: Array<Required<BeybladeStats>['partMatcaps']> = [
     {
-        wheel: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
-        ring: matcapUrl('0C0CC3_04049F_040483_04045C.png'),
-        bolt: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
-        spinTrack: matcapUrl('070B0C_B2C7CE_728FA3_5B748B.png'),
-        tip: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png')
+        wheel: ALLOWED_MATCAP_URLS[0],
+        ring: ALLOWED_MATCAP_URLS[1],
+        bolt: ALLOWED_MATCAP_URLS[2],
+        spinTrack: ALLOWED_MATCAP_URLS[3],
+        tip: ALLOWED_MATCAP_URLS[4]
     },
     {
-        wheel: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
-        ring: matcapUrl('0DBD0D_049704_047B04_045504.png'),
-        bolt: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
-        spinTrack: matcapUrl('0C430C_257D25_439A43_3C683C.png'),
-        tip: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png')
+        wheel: ALLOWED_MATCAP_URLS[5],
+        ring: ALLOWED_MATCAP_URLS[4],
+        bolt: ALLOWED_MATCAP_URLS[0],
+        spinTrack: ALLOWED_MATCAP_URLS[1],
+        tip: ALLOWED_MATCAP_URLS[2]
     },
     {
-        wheel: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
-        ring: matcapUrl('0D0DE3_040486_0404AF_0404CF.png'),
-        bolt: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
-        spinTrack: matcapUrl('0F990F_047B04_044604_046704.png'),
-        tip: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png')
+        wheel: ALLOWED_MATCAP_URLS[3],
+        ring: ALLOWED_MATCAP_URLS[2],
+        bolt: ALLOWED_MATCAP_URLS[5],
+        spinTrack: ALLOWED_MATCAP_URLS[4],
+        tip: ALLOWED_MATCAP_URLS[1]
     }
 ];
 
@@ -973,24 +1111,24 @@ const CURATED_PALETTES: TPalette[] = [
 ];
 
 const BEY_PRESET_CONFIGS_JSON = `[
-  {"name":"Jackpot Volt","style":"crit sprinter","stats":{"atk":13,"def":4,"sta":1.1,"spd":72,"wt":0.9,"crtAtk":30,"beyScale":0.96,"wheelColor":"#18090b","ringColor":"#ff243e","boltColor":"#ffd21a","spinTrackColor":"#2ec7ff","tipColor":"#fff8ed","ringRadiusFactor":0.78,"ringSides":48,"boltSides":6}},
+  {"name":"Jackpot Volt","style":"crit sprinter","stats":{"atk":13,"def":4,"sta":1.1,"spd":72,"wt":0.9,"crtAtk":30,"beyScale":0.96,"wheelColor":"#222222","ringColor":"#ff243e","boltColor":"#ffd21a","spinTrackColor":"#2ec7ff","tipColor":"#fff8ed","ringRadiusFactor":0.78,"ringSides":48,"boltSides":6}},
   {"name":"Storm Pegasus","style":"wide attack","stats":{"atk":12,"def":5,"sta":1.0,"spd":74,"wt":0.94,"crtAtk":29,"beyScale":0.98,"wheelColor":"#12315a","ringColor":"#2ec7ff","boltColor":"#fff8ed","spinTrackColor":"#ff243e","tipColor":"#ffd21a","ringRadiusFactor":0.82,"ringSides":64,"boltSides":5}},
-  {"name":"Inferno Bull","style":"heavy burst","stats":{"atk":11,"def":8,"sta":1.3,"spd":56,"wt":1.34,"crtAtk":27,"beyScale":1.08,"wheelColor":"#240b0d","ringColor":"#ff7a12","boltColor":"#ff243e","spinTrackColor":"#ffd21a","tipColor":"#fff8ed","ringRadiusFactor":0.86,"ringSides":32,"boltSides":8}},
+  {"name":"Inferno Bull","style":"heavy burst","stats":{"atk":11,"def":8,"sta":1.3,"spd":56,"wt":1.34,"crtAtk":27,"beyScale":1.08,"wheelColor":"#222222","ringColor":"#ff7a12","boltColor":"#ff243e","spinTrackColor":"#ffd21a","tipColor":"#fff8ed","ringRadiusFactor":0.86,"ringSides":32,"boltSides":8}},
   {"name":"Aqua Leone","style":"guard counter","stats":{"atk":8,"def":9,"sta":1.5,"spd":58,"wt":1.22,"crtAtk":22,"beyScale":1.04,"wheelColor":"#0b1722","ringColor":"#2ec7ff","boltColor":"#a736ff","spinTrackColor":"#fff8ed","tipColor":"#ffd21a","ringRadiusFactor":0.8,"ringSides":40,"boltSides":6}},
-  {"name":"Solar Wyvern","style":"stamina arc","stats":{"atk":9,"def":6,"sta":1.8,"spd":61,"wt":1.05,"crtAtk":24,"beyScale":1.0,"wheelColor":"#23150a","ringColor":"#ffd21a","boltColor":"#ff7a12","spinTrackColor":"#fff8ed","tipColor":"#ff243e","ringRadiusFactor":0.74,"ringSides":48,"boltSides":6}},
-  {"name":"Violet Lynx","style":"orbit control","stats":{"atk":10,"def":6,"sta":1.2,"spd":68,"wt":1.0,"crtAtk":26,"beyScale":0.99,"wheelColor":"#170d24","ringColor":"#a736ff","boltColor":"#2ec7ff","spinTrackColor":"#ff243e","tipColor":"#fff8ed","ringRadiusFactor":0.72,"ringSides":64,"boltSides":5}},
-  {"name":"Crimson Eagle","style":"air dash","stats":{"atk":13,"def":5,"sta":0.95,"spd":76,"wt":0.92,"crtAtk":31,"beyScale":0.95,"wheelColor":"#160914","ringColor":"#ff243e","boltColor":"#fff8ed","spinTrackColor":"#ff7a12","tipColor":"#2ec7ff","ringRadiusFactor":0.76,"ringSides":56,"boltSides":6}},
+  {"name":"Solar Wyvern","style":"stamina arc","stats":{"atk":9,"def":6,"sta":1.8,"spd":61,"wt":1.05,"crtAtk":24,"beyScale":1.0,"wheelColor":"#222222","ringColor":"#ffd21a","boltColor":"#ff7a12","spinTrackColor":"#fff8ed","tipColor":"#ff243e","ringRadiusFactor":0.74,"ringSides":48,"boltSides":6}},
+  {"name":"Violet Lynx","style":"orbit control","stats":{"atk":10,"def":6,"sta":1.2,"spd":68,"wt":1.0,"crtAtk":26,"beyScale":0.99,"wheelColor":"#222222","ringColor":"#a736ff","boltColor":"#2ec7ff","spinTrackColor":"#ff243e","tipColor":"#fff8ed","ringRadiusFactor":0.72,"ringSides":64,"boltSides":5}},
+  {"name":"Crimson Eagle","style":"air dash","stats":{"atk":13,"def":5,"sta":0.95,"spd":76,"wt":0.92,"crtAtk":31,"beyScale":0.95,"wheelColor":"#222222","ringColor":"#ff243e","boltColor":"#fff8ed","spinTrackColor":"#ff7a12","tipColor":"#2ec7ff","ringRadiusFactor":0.76,"ringSides":56,"boltSides":6}},
   {"name":"Chrome Kraken","style":"dense defense","stats":{"atk":8,"def":10,"sta":1.45,"spd":50,"wt":1.42,"crtAtk":21,"beyScale":1.09,"wheelColor":"#d7dde5","ringColor":"#1d2730","boltColor":"#2ec7ff","spinTrackColor":"#ff7a12","tipColor":"#ffd21a","ringRadiusFactor":0.88,"ringSides":32,"boltSides":8}},
-  {"name":"Nova Fox","style":"balanced burst","stats":{"atk":11,"def":6,"sta":1.25,"spd":65,"wt":1.05,"crtAtk":27,"beyScale":1.0,"wheelColor":"#1a1212","ringColor":"#ff7a12","boltColor":"#ffd21a","spinTrackColor":"#2ec7ff","tipColor":"#fff8ed","ringRadiusFactor":0.8,"ringSides":48,"boltSides":6}},
-  {"name":"Thunder Roc","style":"impact tank","stats":{"atk":12,"def":8,"sta":1.15,"spd":54,"wt":1.32,"crtAtk":30,"beyScale":1.07,"wheelColor":"#23140a","ringColor":"#ffd21a","boltColor":"#ff243e","spinTrackColor":"#a736ff","tipColor":"#fff8ed","ringRadiusFactor":0.84,"ringSides":40,"boltSides":8}},
+  {"name":"Nova Fox","style":"balanced burst","stats":{"atk":11,"def":6,"sta":1.25,"spd":65,"wt":1.05,"crtAtk":27,"beyScale":1.0,"wheelColor":"#222222","ringColor":"#ff7a12","boltColor":"#ffd21a","spinTrackColor":"#2ec7ff","tipColor":"#fff8ed","ringRadiusFactor":0.8,"ringSides":48,"boltSides":6}},
+  {"name":"Thunder Roc","style":"impact tank","stats":{"atk":12,"def":8,"sta":1.15,"spd":54,"wt":1.32,"crtAtk":30,"beyScale":1.07,"wheelColor":"#222222","ringColor":"#ffd21a","boltColor":"#ff243e","spinTrackColor":"#a736ff","tipColor":"#fff8ed","ringRadiusFactor":0.84,"ringSides":40,"boltSides":8}},
   {"name":"Blizzard Hare","style":"light drift","stats":{"atk":9,"def":5,"sta":1.55,"spd":73,"wt":0.86,"crtAtk":23,"beyScale":0.94,"wheelColor":"#eef8ff","ringColor":"#2ec7ff","boltColor":"#a736ff","spinTrackColor":"#fff8ed","tipColor":"#ff243e","ringRadiusFactor":0.7,"ringSides":64,"boltSides":5}},
-  {"name":"Magma Serpent","style":"wall bite","stats":{"atk":12,"def":7,"sta":1.05,"spd":62,"wt":1.16,"crtAtk":29,"beyScale":1.02,"wheelColor":"#190707","ringColor":"#ff243e","boltColor":"#ff7a12","spinTrackColor":"#ffd21a","tipColor":"#fff8ed","ringRadiusFactor":0.82,"ringSides":36,"boltSides":6}},
-  {"name":"Comet Panda","style":"stamina guard","stats":{"atk":7,"def":8,"sta":1.9,"spd":52,"wt":1.18,"crtAtk":20,"beyScale":1.05,"wheelColor":"#fff8ed","ringColor":"#160914","boltColor":"#ffd21a","spinTrackColor":"#2ec7ff","tipColor":"#ff243e","ringRadiusFactor":0.76,"ringSides":48,"boltSides":8}},
+  {"name":"Magma Serpent","style":"wall bite","stats":{"atk":12,"def":7,"sta":1.05,"spd":62,"wt":1.16,"crtAtk":29,"beyScale":1.02,"wheelColor":"#222222","ringColor":"#ff243e","boltColor":"#ff7a12","spinTrackColor":"#ffd21a","tipColor":"#fff8ed","ringRadiusFactor":0.82,"ringSides":36,"boltSides":6}},
+  {"name":"Comet Panda","style":"stamina guard","stats":{"atk":7,"def":8,"sta":1.9,"spd":52,"wt":1.18,"crtAtk":20,"beyScale":1.05,"wheelColor":"#fff8ed","ringColor":"#222222","boltColor":"#ffd21a","spinTrackColor":"#2ec7ff","tipColor":"#ff243e","ringRadiusFactor":0.76,"ringSides":48,"boltSides":8}},
   {"name":"Azure Dragon","style":"fast curve","stats":{"atk":11,"def":5,"sta":1.2,"spd":75,"wt":0.96,"crtAtk":28,"beyScale":0.98,"wheelColor":"#07121f","ringColor":"#2ec7ff","boltColor":"#ffd21a","spinTrackColor":"#a736ff","tipColor":"#fff8ed","ringRadiusFactor":0.74,"ringSides":56,"boltSides":5}},
-  {"name":"Ember Tiger","style":"crit brawler","stats":{"atk":14,"def":4,"sta":0.9,"spd":69,"wt":1.02,"crtAtk":33,"beyScale":1.0,"wheelColor":"#240908","ringColor":"#ff7a12","boltColor":"#ff243e","spinTrackColor":"#fff8ed","tipColor":"#ffd21a","ringRadiusFactor":0.78,"ringSides":44,"boltSides":6}},
-  {"name":"Ghost Mantis","style":"precision edge","stats":{"atk":10,"def":6,"sta":1.35,"spd":70,"wt":0.98,"crtAtk":25,"beyScale":0.97,"wheelColor":"#fff8ed","ringColor":"#a736ff","boltColor":"#2ec7ff","spinTrackColor":"#160914","tipColor":"#ffd21a","ringRadiusFactor":0.68,"ringSides":64,"boltSides":5}},
+  {"name":"Ember Tiger","style":"crit brawler","stats":{"atk":14,"def":4,"sta":0.9,"spd":69,"wt":1.02,"crtAtk":33,"beyScale":1.0,"wheelColor":"#222222","ringColor":"#ff7a12","boltColor":"#ff243e","spinTrackColor":"#fff8ed","tipColor":"#ffd21a","ringRadiusFactor":0.78,"ringSides":44,"boltSides":6}},
+  {"name":"Ghost Mantis","style":"precision edge","stats":{"atk":10,"def":6,"sta":1.35,"spd":70,"wt":0.98,"crtAtk":25,"beyScale":0.97,"wheelColor":"#fff8ed","ringColor":"#a736ff","boltColor":"#2ec7ff","spinTrackColor":"#222222","tipColor":"#ffd21a","ringRadiusFactor":0.68,"ringSides":64,"boltSides":5}},
   {"name":"Iron Rhino","style":"slow crusher","stats":{"atk":10,"def":11,"sta":1.25,"spd":46,"wt":1.5,"crtAtk":26,"beyScale":1.1,"wheelColor":"#2b2f35","ringColor":"#ff243e","boltColor":"#ffd21a","spinTrackColor":"#fff8ed","tipColor":"#2ec7ff","ringRadiusFactor":0.9,"ringSides":32,"boltSides":8}},
-  {"name":"Pulse Phoenix","style":"comeback spin","stats":{"atk":11,"def":7,"sta":1.45,"spd":64,"wt":1.08,"crtAtk":28,"beyScale":1.03,"wheelColor":"#170814","ringColor":"#ff243e","boltColor":"#ffd21a","spinTrackColor":"#ff7a12","tipColor":"#2ec7ff","ringRadiusFactor":0.8,"ringSides":48,"boltSides":6}}
+  {"name":"Pulse Phoenix","style":"comeback spin","stats":{"atk":11,"def":7,"sta":1.45,"spd":64,"wt":1.08,"crtAtk":28,"beyScale":1.03,"wheelColor":"#222222","ringColor":"#ff243e","boltColor":"#ffd21a","spinTrackColor":"#ff7a12","tipColor":"#2ec7ff","ringRadiusFactor":0.8,"ringSides":48,"boltSides":6}}
 ]`;
 
 const COLOR_STAT_KEYS = new Set(['wheelColor', 'ringColor', 'boltColor', 'spinTrackColor', 'tipColor', 'trailColor']);
@@ -1227,9 +1365,23 @@ function syncTrailWithBolt(stats: BeybladeStats) {
     stats.trailColor = stats.boltColor;
 }
 
+function sanitizePartMatcaps(stats: BeybladeStats) {
+    if (!stats.partMatcaps) return;
+
+    const sanitized: NonNullable<BeybladeStats['partMatcaps']> = {};
+    MATCAP_PART_KEYS.forEach((key) => {
+        const url = stats.partMatcaps?.[key];
+        if (!url) return;
+        sanitized[key] = ALLOWED_MATCAP_SET.has(url) ? url : defaultMatcapUrl;
+    });
+    stats.partMatcaps = sanitized;
+}
+
 function savePresets() {
     syncTrailWithBolt(PLAYER_STATS);
     syncTrailWithBolt(ENEMY_STATS);
+    sanitizePartMatcaps(PLAYER_STATS);
+    sanitizePartMatcaps(ENEMY_STATS);
     enforceBeyColorContrast(PLAYER_STATS);
     enforceBeyColorContrast(ENEMY_STATS);
     localStorage.setItem('bblade_player_stats', JSON.stringify(PLAYER_STATS));
@@ -1243,6 +1395,7 @@ function loadPresets() {
         const parsed = JSON.parse(pData);
         Object.assign(PLAYER_STATS, { ...DEFAULT_PLAYER_STATS, ...parsed });
         if (!parsed.trailColor || parsed.trailColor === 0x00ffff) syncTrailWithBolt(PLAYER_STATS);
+        sanitizePartMatcaps(PLAYER_STATS);
         enforceBeyColorContrast(PLAYER_STATS);
     }
     const eData = localStorage.getItem('bblade_enemy_stats');
@@ -1250,6 +1403,7 @@ function loadPresets() {
         const parsed = JSON.parse(eData);
         Object.assign(ENEMY_STATS, { ...DEFAULT_ENEMY_STATS, ...parsed });
         if (!parsed.trailColor || parsed.trailColor === 0x00ffff) syncTrailWithBolt(ENEMY_STATS);
+        sanitizePartMatcaps(ENEMY_STATS);
         enforceBeyColorContrast(ENEMY_STATS);
     }
 }
@@ -1329,6 +1483,17 @@ updateGuide(currentLaunchAngle.value);
 let isDragging = false;
 let hasLaunched = false;
 let gameOver = false;
+let tutorialModeActive = false;
+let tutorialPauseActive = false;
+let tutorialSlowMoActive = false;
+let tutorialPhase: 'idle' | 'aim' | 'launch' | 'waitingDiveMoment' | 'dive' | 'gainSpeed' | 'speedModal' | 'waitingCrit' | 'finishModal' | 'complete' = 'idle';
+let tutorialNextPromptAt = 0;
+let tutorialPromptEl: HTMLElement | null = null;
+let tutorialWarningEl: HTMLElement | null = null;
+let tutorialWarningTimeout: number | undefined;
+let tutorialLastWallWarningAt = -Infinity;
+let tutorialHighlightEl: HTMLElement | null = null;
+let tutorialLayerEl: HTMLElement | null = null;
 
 // Stats snapshots at match start (for "Keep Power-Ups" reset)
 let matchStartPlayerStats: BeybladeStats | null = null;
@@ -1374,6 +1539,18 @@ hudTopBar.innerHTML = `
     </div>
 `;
 uiContainer.appendChild(hudTopBar);
+
+const topMenuBtn = document.createElement('button');
+topMenuBtn.className = 'top-menu-btn';
+topMenuBtn.title = 'Menu';
+topMenuBtn.setAttribute('aria-label', 'Menu');
+topMenuBtn.innerHTML = `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 7h16M4 12h16M4 17h16" />
+    </svg>
+    <span>Menu</span>
+`;
+uiContainer.appendChild(topMenuBtn);
 
 // Floating Action HUD (Pool + Reset buttons)
 const actionHud = document.createElement('div');
@@ -1445,6 +1622,7 @@ const setPattern = (e: Event | null, pattern: number) => {
     if (pattern === 1) cycleBtn.classList.add('active');
     else cycleBtn.classList.remove('active');
     updatePhysicsFromPattern();
+    if (pattern === 1) handleTutorialDivePressed();
 };
 
 // Input for Dive Mode (Space)
@@ -1524,6 +1702,29 @@ function createSpark(x: number, y: number, color: number, speedVal: number) {
 
 // --- Audio System ---
 const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+const audioMasterGain = audioCtx.createGain();
+audioMasterGain.gain.value = masterVolume;
+audioMasterGain.connect(audioCtx.destination);
+
+function setMasterVolume(value: number) {
+    masterVolume = THREE.MathUtils.clamp(value, 0, 1);
+    localStorage.setItem('bblade_master_volume', masterVolume.toFixed(2));
+    audioMasterGain.gain.setTargetAtTime(masterVolume, audioCtx.currentTime, 0.04);
+}
+
+function setFlashesEnabled(value: boolean) {
+    flashesEnabled = value;
+    localStorage.setItem('bblade_flashes_enabled', String(value));
+    if (!flashesEnabled) {
+        criticalFlashUniforms.uIntensity.value = 0;
+        criticalFlashPlane.visible = false;
+    }
+}
+
+function setGameSpeed(value: TGameSpeedId) {
+    currentGameSpeed = value;
+    localStorage.setItem('bblade_game_speed', value);
+}
 
 // Create a noise buffer once
 const bufferSize = audioCtx.sampleRate * 0.1; // 0.1 seconds
@@ -1531,6 +1732,86 @@ const noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
 const data = noiseBuffer.getChannelData(0);
 for (let i = 0; i < bufferSize; i++) {
     data[i] = Math.random() * 2 - 1;
+}
+
+const windBufferSize = audioCtx.sampleRate * 2;
+const windNoiseBuffer = audioCtx.createBuffer(1, windBufferSize, audioCtx.sampleRate);
+const windData = windNoiseBuffer.getChannelData(0);
+for (let i = 0; i < windBufferSize; i++) {
+    windData[i] = Math.random() * 2 - 1;
+}
+
+type TBeyNoiseLayer = {
+    source: AudioBufferSourceNode;
+    filter: BiquadFilterNode;
+    lowShelf: BiquadFilterNode;
+    gain: GainNode;
+    pan: StereoPannerNode;
+};
+
+let playerNoiseLayer: TBeyNoiseLayer | null = null;
+let enemyNoiseLayer: TBeyNoiseLayer | null = null;
+
+function createBeyNoiseLayer(panValue: number): TBeyNoiseLayer {
+    const source = audioCtx.createBufferSource();
+    const filter = audioCtx.createBiquadFilter();
+    const lowShelf = audioCtx.createBiquadFilter();
+    const gain = audioCtx.createGain();
+    const pan = audioCtx.createStereoPanner();
+
+    source.buffer = windNoiseBuffer;
+    source.loop = true;
+    source.playbackRate.value = 0.62;
+    filter.type = 'lowpass';
+    filter.frequency.value = 540;
+    filter.Q.value = 0.95;
+    lowShelf.type = 'lowshelf';
+    lowShelf.frequency.value = 180;
+    lowShelf.gain.value = 5;
+    gain.gain.value = 0;
+    pan.pan.value = panValue;
+
+    source.connect(filter);
+    filter.connect(lowShelf);
+    lowShelf.connect(gain);
+    gain.connect(pan);
+    pan.connect(audioMasterGain);
+    source.start();
+
+    return { source, filter, lowShelf, gain, pan };
+}
+
+function ensureBeyNoiseLayers() {
+    if (!playerNoiseLayer) playerNoiseLayer = createBeyNoiseLayer(-0.28);
+    if (!enemyNoiseLayer) enemyNoiseLayer = createBeyNoiseLayer(0.28);
+}
+
+function updateBeyNoiseLayer(layer: TBeyNoiseLayer | null, entity: GameEntity, panValue: number) {
+    if (!layer) return;
+
+    const speed = hasLaunched && !entity.isDead ? entity.body.speed : 0;
+    const speedRatio = THREE.MathUtils.clamp(speed / 18, 0, 1);
+    const now = audioCtx.currentTime;
+    const targetGain = 0.02 + speedRatio * 0.03;
+    const targetFrequency = 520 + speedRatio * 720;
+    const targetPlaybackRate = 0.62 + speedRatio * 0.18;
+
+    layer.gain.gain.cancelScheduledValues(now);
+    layer.filter.frequency.cancelScheduledValues(now);
+    layer.filter.Q.cancelScheduledValues(now);
+    layer.source.playbackRate.cancelScheduledValues(now);
+    layer.pan.pan.cancelScheduledValues(now);
+
+    layer.gain.gain.linearRampToValueAtTime(hasLaunched && !gameOver && !entity.isDead ? targetGain : 0, now + 0.22);
+    layer.filter.frequency.linearRampToValueAtTime(targetFrequency, now + 0.22);
+    layer.filter.Q.linearRampToValueAtTime(0.78 + speedRatio * 0.42, now + 0.22);
+    layer.source.playbackRate.linearRampToValueAtTime(targetPlaybackRate, now + 0.22);
+    layer.pan.pan.linearRampToValueAtTime(panValue, now + 0.22);
+}
+
+function updateBeyNoiseLayers() {
+    updateBeyNoiseLayer(playerNoiseLayer, player, -0.28);
+    updateBeyNoiseLayer(enemyNoiseLayer, enemy, 0.28);
 }
 
 function createReverbImpulse(seconds: number, decay: number) {
@@ -1584,6 +1865,8 @@ function updateCriticalFlashOrigin() {
 }
 
 function triggerCriticalFeedback(worldPoint?: THREE.Vector3) {
+    if (!flashesEnabled) return;
+
     criticalFlashState.worldPoint = worldPoint?.clone();
     camera.updateMatrixWorld(true);
     updateCriticalFlashOrigin();
@@ -1615,8 +1898,8 @@ function playCollisionSound(intensity: number, baseFrequency: number, isCritical
 
     const t = audioCtx.currentTime;
     const masterGain = audioCtx.createGain();
-    masterGain.connect(audioCtx.destination);
-    masterGain.gain.setValueAtTime(intensity, t);
+    masterGain.connect(audioMasterGain);
+    masterGain.gain.setValueAtTime(intensity * 0.5, t);
 
     if (isCritical) {
         const convolver = audioCtx.createConvolver();
@@ -1641,13 +1924,13 @@ function playCollisionSound(intensity: number, baseFrequency: number, isCritical
         masterGain.connect(convolver);
         convolver.connect(reverbTone);
         reverbTone.connect(reverbGain);
-        reverbGain.connect(audioCtx.destination);
+        reverbGain.connect(audioMasterGain);
         masterGain.connect(slapDelay);
         slapDelay.connect(feedback);
         feedback.connect(slapDelay);
         slapDelay.connect(tone);
         tone.connect(wetGain);
-        wetGain.connect(audioCtx.destination);
+        wetGain.connect(audioMasterGain);
     }
 
     // 1. Impact "Thud"
@@ -1670,7 +1953,7 @@ function playCollisionSound(intensity: number, baseFrequency: number, isCritical
     // 2. Heavy Metal Clang
     const scale = isCritical ? [1, 1.25, 1.5, 2] : [1, 3 / 2, 5 / 4, 7 / 4, 2];
     const pick = Math.floor(Math.random() * scale.length);
-    const baseFreq = baseFrequency * scale[pick];
+    const baseFreq = (baseFrequency * scale[pick]) / 1.5;
     const ratios = isCritical ? [1, 2.15, 3.05, 4.6] : [1, 1.5, 2.0, 2.5];
 
     ratios.forEach((ratio, index) => {
@@ -1727,7 +2010,8 @@ Events.on(engine, 'collisionStart', (event) => {
 
             // Sparks & Sound
             const isHighSpeed = isCritA || isCritB;
-
+            if (isCritA) getMatchCounterSide(entityA)!.criticalHits += 1;
+            if (isCritB) getMatchCounterSide(entityB)!.criticalHits += 1;
             const count = isHighSpeed ? 24 : 3;
             const speed = isHighSpeed ? 9 : 2;
             const criticalFlashPoint = getCollisionWorldPoint(pair);
@@ -1750,6 +2034,8 @@ Events.on(engine, 'collisionStart', (event) => {
             }
             if (isHighSpeed) {
                 triggerCriticalFeedback(criticalFlashPoint);
+                if (isCritA) notifyTutorialCriticalHit(entityA);
+                if (isCritB) notifyTutorialCriticalHit(entityB);
                 playCollisionSound(0.34, 675, true);
             } else {
                 playCollisionSound(0.2, 200); // Normal Pitch
@@ -1762,11 +2048,15 @@ Events.on(engine, 'collisionStart', (event) => {
                 if (entityA.currentRpm !== undefined) {
                     entityA.currentRpm = Math.max(0, entityA.currentRpm - BARRIER_DAMAGE);
                 }
+                getMatchCounterSide(entityA)!.wallDings += 1;
+                notifyTutorialWallHit(entityA);
             } else if (entityB && !entityA) {
                 // B hit a wall
                 if (entityB.currentRpm !== undefined) {
                     entityB.currentRpm = Math.max(0, entityB.currentRpm - BARRIER_DAMAGE);
                 }
+                getMatchCounterSide(entityB)!.wallDings += 1;
+                notifyTutorialWallHit(entityB);
             }
 
             if (pair.collision.supports.length > 0) {
@@ -1791,10 +2081,11 @@ function animate() {
     requestAnimationFrame(animate);
 
     // Physics Update
-    const speedMultiplier = GAME_SPEEDS[currentGameSpeed].multiplier;
-    const subStepDelta = ((1000 / 60) * speedMultiplier) / SUBSTEPS;
-    updateCpuDive(clock.getElapsedTime());
-    for (let i = 0; i < SUBSTEPS; i++) {
+    const simulationPaused = tutorialPauseActive;
+    const speedMultiplier = GAME_SPEEDS[currentGameSpeed].multiplier * (tutorialSlowMoActive ? 0.28 : 1);
+    const subStepDelta = simulationPaused ? 0 : ((1000 / 60) * speedMultiplier) / SUBSTEPS;
+    if (!simulationPaused) updateCpuDive(clock.getElapsedTime());
+    for (let i = 0; i < SUBSTEPS && !simulationPaused; i++) {
         Engine.update(engine, subStepDelta);
 
         if (hasLaunched) {
@@ -1920,9 +2211,9 @@ function animate() {
                 if (!gameOver) {
                     gameOver = true;
                     if (entity === player) {
-                        showWinner('CPU WINS');
+                        showWinner('CPU WINS', enemy.stats?.trailColor || ENEMY_STATS.trailColor);
                     } else if (entity === enemy) {
-                        showWinner('P1 WINS');
+                        showWinner('P1 WINS', player.stats?.trailColor || PLAYER_STATS.trailColor);
                     }
                 }
             }
@@ -1962,6 +2253,15 @@ function animate() {
         // Additional Tilt logic (Wobble based on velocity)
         const vel = entity.body.velocity;
         const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
+        updateBeyVortex(
+            entity.mesh,
+            clock.getElapsedTime(),
+            speed,
+            entity.currentRpm || 0,
+            entity.stats?.maxRpm || 1000,
+            entity === player ? 1 : -1,
+            entity.stats?.trailColor
+        );
         const maxTilt = 0.5;
         const tiltAmount = Math.min((speed / 20) * maxTilt, maxTilt);
 
@@ -2066,6 +2366,8 @@ function animate() {
     // Update controls
     controls.update();
     syncCriticalFlashPlaneToCamera();
+    updateBeyNoiseLayers();
+    updateTutorialFlow(clock.getElapsedTime());
 
     if (!hasLaunched) {
         const angle = currentLaunchAngle.value;
@@ -2385,6 +2687,7 @@ function openStatEditor(targetStats: BeybladeStats, targetName: string) {
                 requestAnimationFrame(animatePreview);
 
                 if (previewBeyblade) {
+                    updateBeyVortex(previewBeyblade.mesh, clock.getElapsedTime(), 10, tempStats.maxRpm * 0.72, tempStats.maxRpm, 1, tempStats.trailColor);
                     previewBeyblade.mesh.rotation.y += 0.018;
                     previewBeyblade.spinGroup.rotation.y += 0.04;
                 }
@@ -2399,7 +2702,6 @@ function openStatEditor(targetStats: BeybladeStats, targetName: string) {
         matcapSection.innerHTML = '<div class="section-title">Parts</div>';
         detachedVisualControls.appendChild(matcapSection);
 
-        type TMatcapPart = 'wheel' | 'ring' | 'bolt' | 'spinTrack' | 'tip';
         const parts: Array<{ id: TMatcapPart, label: string, colorKey: keyof BeybladeStats, shapeKeys: Array<keyof BeybladeStats> }> = [
             { id: 'wheel', label: 'Base', colorKey: 'wheelColor', shapeKeys: ['beyScale'] },
             { id: 'ring', label: 'Ring', colorKey: 'ringColor', shapeKeys: ['ringRadiusFactor', 'ringSides'] },
@@ -2491,7 +2793,7 @@ function openStatEditor(targetStats: BeybladeStats, targetName: string) {
                 };
                 grid.appendChild(clearBtn);
 
-                MATCAP_LIBRARY.filter(mc => mc.category !== 'Dark').slice(0, 12).forEach(mc => {
+                MATCAP_LIBRARY.forEach(mc => {
                     const thumbUrl = mc.thumb;
                     const fullUrl = mc.file;
                     const btn = document.createElement('button');
@@ -2662,44 +2964,416 @@ if (cpuBtn) {
     };
 }
 
-function completeTutorial() {
-    tutorialComplete = true;
-    localStorage.setItem('bblade_tutorial_complete', 'true');
+let lastMenuSampleAt = 0;
+
+function playMenuSampleHit() {
+    const now = performance.now();
+    if (now - lastMenuSampleAt < 180) return;
+    lastMenuSampleAt = now;
+
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+    }
+    playCollisionSound(0.24, 260, false);
 }
 
-function showTutorialOverlay() {
-    if (tutorialComplete) return;
+function clearTutorialInstruction(options: { keepSlowMo?: boolean } = {}) {
+    tutorialPromptEl?.remove();
+    tutorialPromptEl = null;
+    tutorialHighlightEl?.classList.remove('tutorial-highlight');
+    tutorialHighlightEl = null;
+    tutorialLayerEl?.classList.remove('tutorial-control-layer');
+    tutorialLayerEl = null;
+    uiContainer.classList.remove('tutorial-ui-layer');
+    if (!options.keepSlowMo) tutorialSlowMoActive = false;
+}
+
+function clearTutorialWarning() {
+    tutorialWarningEl?.remove();
+    tutorialWarningEl = null;
+    if (tutorialWarningTimeout !== undefined) {
+        window.clearTimeout(tutorialWarningTimeout);
+        tutorialWarningTimeout = undefined;
+    }
+}
+
+function setTutorialHighlight(target: HTMLElement | null, layer: HTMLElement | null = null) {
+    tutorialHighlightEl?.classList.remove('tutorial-highlight');
+    tutorialLayerEl?.classList.remove('tutorial-control-layer');
+    uiContainer.classList.remove('tutorial-ui-layer');
+
+    tutorialHighlightEl = target;
+    tutorialLayerEl = layer;
+    target?.classList.add('tutorial-highlight');
+    layer?.classList.add('tutorial-control-layer');
+    if (target && uiContainer.contains(target)) {
+        uiContainer.classList.add('tutorial-ui-layer');
+    }
+}
+
+type TTutorialArrowAlignment = 'start' | 'middle' | 'end';
+
+function positionTutorialMessage(
+    overlay: HTMLElement,
+    target: HTMLElement | null,
+    fallback: 'bottom-left' | 'top-center' = 'bottom-left',
+    arrowAlignment: TTutorialArrowAlignment = 'start'
+) {
+    const message = overlay.querySelector<HTMLElement>('.tutorial-game-message');
+    if (!message) return;
+
+    const margin = 12;
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const messageRect = message.getBoundingClientRect();
+    let left = margin;
+    let top = margin;
+    let arrowSide = 'none';
+
+    if (target) {
+        const rect = target.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        const roomAbove = rect.top;
+        const roomBelow = viewportHeight - rect.bottom;
+        const roomRight = viewportWidth - rect.right;
+        const roomLeft = rect.left;
+
+        if (roomAbove >= messageRect.height + 18 && centerY > viewportHeight * 0.48) {
+            top = rect.top - messageRect.height - 14;
+            left = centerX - messageRect.width / 2;
+            arrowSide = 'bottom';
+        } else if (roomBelow >= messageRect.height + 18) {
+            top = rect.bottom + 14;
+            left = centerX - messageRect.width / 2;
+            arrowSide = 'top';
+        } else if (roomRight >= messageRect.width + 18) {
+            top = centerY - messageRect.height / 2;
+            left = rect.right + 14;
+            arrowSide = 'left';
+        } else if (roomLeft >= messageRect.width + 18) {
+            top = centerY - messageRect.height / 2;
+            left = rect.left - messageRect.width - 14;
+            arrowSide = 'right';
+        } else {
+            top = Math.max(margin, rect.top - messageRect.height - 14);
+            left = centerX - messageRect.width / 2;
+            arrowSide = 'bottom';
+        }
+    } else if (fallback === 'top-center') {
+        top = 80;
+        left = (viewportWidth - messageRect.width) / 2;
+    } else {
+        top = viewportHeight - messageRect.height - 118;
+        left = 18;
+    }
+
+    left = THREE.MathUtils.clamp(left, margin, Math.max(margin, viewportWidth - messageRect.width - margin));
+    top = THREE.MathUtils.clamp(top, margin, Math.max(margin, viewportHeight - messageRect.height - margin));
+    message.style.left = `${left}px`;
+    message.style.top = `${top}px`;
+    message.dataset.arrow = arrowSide === 'none' ? 'none' : `${arrowSide}-${arrowAlignment}`;
+}
+
+function showTutorialInstruction(
+    title: string,
+    body: string,
+    target: HTMLElement | null = null,
+    layer: HTMLElement | null = null,
+    dimGame = true,
+    arrowAlignment: TTutorialArrowAlignment = 'start'
+) {
+    tutorialPromptEl?.remove();
+    setTutorialHighlight(target, layer);
 
     const overlay = document.createElement('div');
-    overlay.className = 'tutorial-overlay';
+    overlay.className = `tutorial-game-overlay${dimGame ? '' : ' tutorial-game-overlay-clear'}`;
+    overlay.dataset.arrowAlignment = arrowAlignment;
     overlay.innerHTML = `
-        <div class="tutorial-panel">
-            <span class="kicker">How to win</span>
-            <h1>Hold DIVE, release, crash.</h1>
-            <p>DIVE pulls your bey into the bowl and builds speed. Release into orbit before contact so the hit lands above critical speed.</p>
-            <div class="tutorial-steps">
-                <div><strong>1</strong><span>Aim the launch cone.</span></div>
-                <div><strong>2</strong><span>Hold DIVE to charge speed.</span></div>
-                <div><strong>3</strong><span>Let go before impact for a critical.</span></div>
+        <div class="tutorial-game-message">
+            <span>How to play</span>
+            <strong>${title}</strong>
+            <p>${body}</p>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    tutorialPromptEl = overlay;
+    requestAnimationFrame(() => positionTutorialMessage(overlay, target, 'bottom-left', arrowAlignment));
+}
+
+function showTutorialWarning(title: string, body: string, target: HTMLElement | null = cycleBtn, arrowAlignment: TTutorialArrowAlignment = 'end') {
+    clearTutorialWarning();
+    tutorialPauseActive = true;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'tutorial-game-overlay tutorial-game-overlay-blocking tutorial-warning-overlay';
+    overlay.dataset.arrowAlignment = arrowAlignment;
+    overlay.innerHTML = `
+        <div class="tutorial-game-message tutorial-warning-message">
+            <span>Warning</span>
+            <strong>${title}</strong>
+            <p>${body}</p>
+            <button class="action-btn save" id="tutorial-warning-continue">Got it</button>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    tutorialWarningEl = overlay;
+    requestAnimationFrame(() => positionTutorialMessage(overlay, target, 'bottom-left', arrowAlignment));
+    overlay.querySelector('#tutorial-warning-continue')?.addEventListener('click', () => {
+        clearTutorialWarning();
+        tutorialPauseActive = false;
+    });
+}
+
+function showTutorialCheckpoint(
+    title: string,
+    body: string,
+    actionLabel: string,
+    onContinue: () => void,
+    target: HTMLElement | null = cycleBtn,
+    arrowAlignment: TTutorialArrowAlignment = 'start'
+) {
+    clearTutorialInstruction({ keepSlowMo: true });
+    tutorialPauseActive = true;
+    setTutorialHighlight(target, target ? cycleBtnContainer : null);
+
+    const overlay = document.createElement('div');
+    overlay.className = 'tutorial-game-overlay tutorial-game-overlay-blocking';
+    overlay.dataset.arrowAlignment = arrowAlignment;
+    overlay.innerHTML = `
+        <div class="tutorial-game-message tutorial-game-checkpoint">
+            <span>How to play</span>
+            <strong>${title}</strong>
+            <p>${body}</p>
+            <button class="action-btn save" id="tutorial-continue">${actionLabel}</button>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    tutorialPromptEl = overlay;
+    requestAnimationFrame(() => positionTutorialMessage(overlay, target, 'top-center', arrowAlignment));
+
+    overlay.querySelector('#tutorial-continue')?.addEventListener('click', () => {
+        clearTutorialInstruction();
+        tutorialPauseActive = false;
+        onContinue();
+    });
+}
+
+function startTutorialMode() {
+    resetMatch();
+    setGameSpeed('tutorial');
+    clearTutorialWarning();
+    tutorialLastWallWarningAt = -Infinity;
+    tutorialModeActive = true;
+    tutorialPauseActive = false;
+    tutorialSlowMoActive = false;
+    tutorialPhase = 'aim';
+    tutorialNextPromptAt = 0;
+    showTutorialInstruction(
+        'Adjust launch angle',
+        'Drag AIM left or right. Release when the opening path feels right.',
+        dragZone,
+        launchContainer,
+        true,
+        'middle'
+    );
+}
+
+function handleTutorialAimComplete() {
+    if (!tutorialModeActive || tutorialPhase !== 'aim') return;
+    tutorialPhase = 'launch';
+    showTutorialInstruction(
+        'Press Launch',
+        'Send your bey into the stadium. The lesson will slow down when DIVE matters.',
+        launchBtn,
+        launchContainer,
+        true,
+        'end'
+    );
+}
+
+function handleTutorialDivePressed() {
+    if (!tutorialModeActive || tutorialPhase !== 'dive') return;
+    clearTutorialInstruction();
+    tutorialPhase = 'gainSpeed';
+    tutorialNextPromptAt = clock.getElapsedTime() + 1.1;
+    showTutorialInstruction(
+        'Control DIVE',
+        'Use short DIVE bursts to gain speed. Sparks mean your bey is ready for bonus damage.',
+        cycleBtn,
+        cycleBtnContainer,
+        false
+    );
+}
+
+function notifyTutorialCriticalHit(entity: GameEntity) {
+    if (!tutorialModeActive || entity !== player || tutorialPhase !== 'waitingCrit') return;
+    tutorialPhase = 'finishModal';
+    showTutorialCheckpoint(
+        'Critical hit landed',
+        'That flash means your fast hit connected. Critical hits deal bonus damage.',
+        'Continue',
+        () => {
+            tutorialPhase = 'finishModal';
+            tutorialNextPromptAt = clock.getElapsedTime() + 0.1;
+        },
+        cycleBtn,
+        'end'
+    );
+}
+
+function notifyTutorialWallHit(entity: GameEntity) {
+    if (!tutorialModeActive || tutorialPauseActive || gameOver || entity !== player) return;
+    if (tutorialPhase === 'idle' || tutorialPhase === 'aim' || tutorialPhase === 'launch' || tutorialPhase === 'complete') return;
+
+    const now = clock.getElapsedTime();
+    if (now - tutorialLastWallWarningAt < 5) return;
+    tutorialLastWallWarningAt = now;
+
+    showTutorialWarning(
+        'Wall hit',
+        'Bumping the stadium wall drains RPM. Use shorter DIVE bursts and curve back before the rim.',
+        cycleBtn,
+        'end'
+    );
+}
+
+function updateTutorialFlow(now: number) {
+    if (!tutorialModeActive || tutorialPauseActive || gameOver) return;
+
+    if (tutorialPhase === 'waitingDiveMoment') {
+        const cpuDist = Math.hypot(enemy.body.position.x, enemy.body.position.y);
+        const playerDist = Math.hypot(player.body.position.x, player.body.position.y);
+        const goodDiveMoment = cpuDist < 120 && playerDist > 115;
+        const fallbackDiveMoment = now >= tutorialNextPromptAt && playerDist > 92;
+
+        if (goodDiveMoment || fallbackDiveMoment) {
+            tutorialPhase = 'dive';
+            tutorialSlowMoActive = true;
+            showTutorialInstruction(
+                'Hold DIVE now',
+                'Your bey is wide while CPU is near center. Dive inward to turn speed into the hit.',
+                cycleBtn,
+                cycleBtnContainer
+            );
+        }
+        return;
+    }
+
+    if (tutorialPhase === 'gainSpeed' && now >= tutorialNextPromptAt && player.body.speed > CRIT_SPEED_THRESHOLD) {
+        tutorialPhase = 'speedModal';
+        tutorialNextPromptAt = now + 0.1;
+        return;
+    }
+
+    if (tutorialPhase === 'speedModal' && now >= tutorialNextPromptAt) {
+        showTutorialCheckpoint(
+            'Speed gained',
+            'Your bey has gained speed. Hitting the opponent in this state deals extra damage.',
+            'Go for criticals',
+            () => {
+                tutorialPhase = 'waitingCrit';
+                showTutorialInstruction(
+                    'Land the hit',
+                    'Keep controlling DIVE and collide while fast. Critical hits flash and hit harder.',
+                    cycleBtn,
+                    cycleBtnContainer,
+                    false
+                );
+            }
+        );
+        return;
+    }
+
+    if (tutorialPhase === 'finishModal' && now >= tutorialNextPromptAt) {
+        showTutorialCheckpoint(
+            'Last one standing wins',
+            'Drain the opponent RPM to zero or knock them out. Keep enough stamina to stay spinning.',
+            'Finish match',
+            () => {
+                setGameSpeed('tutorial');
+                clearTutorialWarning();
+                tutorialPhase = 'complete';
+                tutorialModeActive = false;
+            }
+        );
+    }
+}
+
+function showMenuDialog() {
+    if (document.querySelector('.menu-overlay')) return;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'tutorial-overlay menu-overlay';
+    const speedOptions = (Object.entries(GAME_SPEEDS) as Array<[TGameSpeedId, typeof GAME_SPEEDS[TGameSpeedId]]>)
+        .map(([id, option]) => `
+            <label class="menu-speed-option ${id === currentGameSpeed ? 'active' : ''}">
+                <input type="radio" name="menu-speed" value="${id}" ${id === currentGameSpeed ? 'checked' : ''}>
+                <span>${option.label}</span>
+            </label>
+        `).join('');
+
+    overlay.innerHTML = `
+        <div class="tutorial-panel menu-panel">
+            <span class="kicker">Battle menu</span>
+            <h1>Settings</h1>
+            <div class="menu-options">
+                <label class="menu-option">
+                    <span>Sound</span>
+                    <input id="menu-volume" type="range" min="0" max="1" step="0.01" value="${masterVolume}">
+                </label>
+                <label class="menu-option menu-option-inline">
+                    <span>Flashes</span>
+                    <input id="menu-flashes" type="checkbox" ${flashesEnabled ? 'checked' : ''}>
+                </label>
+                <div class="menu-option">
+                    <span>Game speed</span>
+                    <div class="menu-speed-grid">${speedOptions}</div>
+                </div>
             </div>
             <div class="tutorial-actions">
-                <button class="action-btn reset" id="tutorial-skip">I know this</button>
-                <button class="action-btn save" id="tutorial-start">Start training</button>
+                <button class="action-btn reset" id="menu-tutorial">How to play</button>
+                <button class="action-btn save" id="menu-start">Play</button>
             </div>
         </div>
     `;
     document.body.appendChild(overlay);
 
-    const close = () => {
-        completeTutorial();
-        overlay.remove();
-    };
+    overlay.querySelector<HTMLInputElement>('#menu-volume')?.addEventListener('input', (event) => {
+        setMasterVolume(Number((event.target as HTMLInputElement).value));
+    });
+    const volumeInput = overlay.querySelector<HTMLInputElement>('#menu-volume');
+    volumeInput?.addEventListener('pointerup', playMenuSampleHit);
+    volumeInput?.addEventListener('change', playMenuSampleHit);
+    overlay.querySelector<HTMLInputElement>('#menu-flashes')?.addEventListener('change', (event) => {
+        setFlashesEnabled((event.target as HTMLInputElement).checked);
+    });
+    overlay.querySelectorAll<HTMLInputElement>('input[name="menu-speed"]').forEach((input) => {
+        input.addEventListener('change', () => {
+            if (!isGameSpeedId(input.value)) return;
+            setGameSpeed(input.value);
+            overlay.querySelectorAll('.menu-speed-option').forEach(option => option.classList.remove('active'));
+            input.closest('.menu-speed-option')?.classList.add('active');
+        });
+    });
 
-    overlay.querySelector('#tutorial-start')?.addEventListener('click', close);
-    overlay.querySelector('#tutorial-skip')?.addEventListener('click', close);
+    overlay.querySelector('#menu-start')?.addEventListener('click', () => {
+        tutorialModeActive = false;
+        tutorialPauseActive = false;
+        tutorialSlowMoActive = false;
+        tutorialPhase = 'idle';
+        clearTutorialInstruction();
+        clearTutorialWarning();
+        overlay.remove();
+    });
+    overlay.querySelector('#menu-tutorial')?.addEventListener('click', () => {
+        overlay.remove();
+        startTutorialMode();
+    });
 }
 
-showTutorialOverlay();
+topMenuBtn.onclick = showMenuDialog;
+showMenuDialog();
 
 animate();
 
@@ -2710,8 +3384,30 @@ animate();
 
 launchBtn.addEventListener('click', () => {
     if (hasLaunched) return;
+    if (tutorialModeActive && tutorialPhase === 'aim') {
+        showTutorialInstruction(
+            'Adjust launch angle',
+            'Drag AIM left or right first. Release when the opening path feels right.',
+            dragZone,
+            launchContainer,
+            true,
+            'middle'
+        );
+        return;
+    }
 
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+    }
+    ensureBeyNoiseLayers();
+
+    resetMatchCounters();
     hasLaunched = true;
+    if (tutorialModeActive && tutorialPhase === 'launch') {
+        clearTutorialInstruction();
+        tutorialPhase = 'waitingDiveMoment';
+        tutorialNextPromptAt = clock.getElapsedTime() + 2.4;
+    }
     setCpuPattern(0);
     scheduleNextCpuDiveSwitch(clock.getElapsedTime() + 0.5);
 
@@ -2776,17 +3472,46 @@ window.addEventListener('resize', () => {
 
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
+    if (tutorialPromptEl?.classList.contains('tutorial-game-overlay')) {
+        const arrowAlignment = (tutorialPromptEl.dataset.arrowAlignment as TTutorialArrowAlignment | undefined) || 'start';
+        positionTutorialMessage(tutorialPromptEl, tutorialHighlightEl, 'bottom-left', arrowAlignment);
+    }
+    if (tutorialWarningEl?.classList.contains('tutorial-game-overlay')) {
+        const arrowAlignment = (tutorialWarningEl.dataset.arrowAlignment as TTutorialArrowAlignment | undefined) || 'end';
+        positionTutorialMessage(tutorialWarningEl, cycleBtn, 'bottom-left', arrowAlignment);
+    }
 });
 
 // Game Over / Winner UI
-function showWinner(text: string) {
+function showWinner(text: string, accentColor = 0xf7cf2e) {
     const overlay = document.createElement('div');
     overlay.className = 'winner-overlay';
+    const accent = `#${numberToHex(accentColor)}`;
+    const accentRgb = `${(accentColor >> 16) & 255}, ${(accentColor >> 8) & 255}, ${accentColor & 255}`;
+    overlay.style.setProperty('--winner-color', accent);
+    overlay.style.setProperty('--winner-glow', `#${numberToHex(clampBeyColor(accentColor))}`);
+    overlay.style.setProperty('--winner-rgb', accentRgb);
 
     const title = document.createElement('div');
     title.className = 'winner-title';
     title.innerText = text;
     overlay.appendChild(title);
+
+    const stats = document.createElement('div');
+    stats.className = 'winner-stats';
+    stats.innerHTML = `
+        <div class="winner-stats-row">
+            <span>P1</span>
+            <span><strong>${matchCounters.player.criticalHits}</strong> CRT</span>
+            <span><strong>${matchCounters.player.wallDings}</strong> DNG</span>
+        </div>
+        <div class="winner-stats-row">
+            <span>CPU</span>
+            <span><strong>${matchCounters.enemy.criticalHits}</strong> CRT</span>
+            <span><strong>${matchCounters.enemy.wallDings}</strong> DNG</span>
+        </div>
+    `;
+    overlay.appendChild(stats);
 
     const rematchBtn = document.createElement('button');
     rematchBtn.className = 'rematch-btn';
@@ -2836,10 +3561,11 @@ const resetEntityVisualsAndPhysics = (entity: GameEntity, stats: BeybladeStats, 
     entity.mesh.quaternion.set(0, 0, 0, 1);
 
     // 4. Update Trail Color
-    if (entity.trail && entity.trail.mesh.material instanceof THREE.LineBasicMaterial) {
-        entity.trail.mesh.material.color.setHex(stats.trailColor);
+    if (entity.trail) {
+        entity.trail.setColor(stats.trailColor);
         entity.trail.clear();
     }
+    setBeyVortexColor(entity.mesh, stats.trailColor);
 
     // 5. Reset Game Logic Stats
     entity.stats = stats; // Ensure reference is up to date
@@ -2854,6 +3580,7 @@ const resetEntityVisualsAndPhysics = (entity: GameEntity, stats: BeybladeStats, 
 function resetMatch() {
     hasLaunched = false;
     gameOver = false;
+    resetMatchCounters();
 
     // Update action HUD buttons
     resetHint.style.display = 'none';
