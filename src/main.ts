@@ -18,15 +18,13 @@ engine.gravity.y = 0;
 engine.gravity.scale = 0;
 const clock = new THREE.Clock();
 
-
-
 // Increase solver iterations for stability with high speed collisions
 engine.positionIterations = 16;
 engine.velocityIterations = 16;
 
 // --- Rendering Setup (Three.js) ---
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x222222);
+scene.background = new THREE.Color(0x000000);
 
 // Orthographic Camera Setup
 const aspect = window.innerWidth / window.innerHeight;
@@ -42,10 +40,12 @@ const camera = new THREE.OrthographicCamera(
 // Position camera for a slanted top-down view
 camera.position.set(0, 600, 400);
 camera.lookAt(0, 0, 0);
+scene.add(camera);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio); // Fix pixelation
 renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.body.appendChild(renderer.domElement);
 
 // --- Orbit Controls ---
@@ -53,20 +53,94 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = false;
 controls.maxPolarAngle = Math.PI / 2 - 0.1; // Keep floor constraint
 
+const criticalFlashUniforms = {
+    uIntensity: { value: 0 },
+    uOrigin: { value: new THREE.Vector2(0.5, 0.5) },
+    uAspect: { value: window.innerWidth / window.innerHeight }
+};
+
+const criticalFlashMaterial = new THREE.ShaderMaterial({
+    uniforms: criticalFlashUniforms,
+    vertexShader: `
+        varying vec2 vUv;
+        void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    `,
+    fragmentShader: `
+        uniform float uIntensity;
+        uniform vec2 uOrigin;
+        uniform float uAspect;
+        varying vec2 vUv;
+
+        void main() {
+            vec2 p = vec2((vUv.x - uOrigin.x) * uAspect, vUv.y - uOrigin.y);
+            float d = length(p);
+            float core = pow(smoothstep(0.13, 0.0, d), 0.55) * 1.18;
+            float hotEdge = smoothstep(0.2, 0.11, d) * smoothstep(0.045, 0.12, d) * 0.46;
+            float halo = pow(smoothstep(1.22, 0.09, d), 2.8) * 0.64;
+            float ring = smoothstep(0.43, 0.34, d) * smoothstep(0.27, 0.36, d) * 0.58;
+            float outerSnap = smoothstep(0.78, 0.68, d) * smoothstep(0.56, 0.69, d) * 0.2;
+            float alpha = clamp((core + halo + ring) * uIntensity, 0.0, 1.0);
+            alpha = clamp(alpha + outerSnap * uIntensity, 0.0, 1.0);
+            vec3 color = mix(vec3(1.0), vec3(1.0, 0.86, 0.52), smoothstep(0.08, 0.48, d));
+            gl_FragColor = vec4(color, alpha);
+        }
+    `,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+});
+
+const criticalFlashPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), criticalFlashMaterial);
+criticalFlashPlane.position.set(0, 0, -10);
+criticalFlashPlane.renderOrder = 9999;
+criticalFlashPlane.visible = false;
+camera.add(criticalFlashPlane);
+
+const criticalFlashState = {
+    startedAt: -Infinity,
+    duration: 0.34,
+    worldPoint: undefined as THREE.Vector3 | undefined
+};
+
+function syncCriticalFlashPlaneToCamera() {
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld(true);
+    const viewWidth = (camera.right - camera.left) / camera.zoom;
+    const viewHeight = (camera.top - camera.bottom) / camera.zoom;
+    const overscan = 1.08;
+    criticalFlashUniforms.uAspect.value = viewWidth / viewHeight;
+    criticalFlashPlane.scale.set(viewWidth * overscan, viewHeight * overscan, 1);
+}
+
+syncCriticalFlashPlaneToCamera();
+
 // --- Launch UI (Slider + Button)
 const launchContainer = document.createElement('div');
 launchContainer.id = 'launch-container';
 document.body.appendChild(launchContainer);
 
 
-const currentLaunchAngle = { value: 0 };
+const DEFAULT_LAUNCH_ANGLE = 180;
+const currentLaunchAngle = { value: DEFAULT_LAUNCH_ANGLE };
 
 // -- Linear Slider --
 // -- Pointer Lock Drag Zone --
 // -- Pointer Lock Drag Zone (Touch Compatible) --
 const dragZone = document.createElement('div');
 dragZone.className = 'drag-zone';
-dragZone.innerText = "Adjust Launch Angle";
+dragZone.innerHTML = `
+    <svg class="aim-icon aim-icon-left" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M15 5L8 12L15 19" />
+    </svg>
+    <span class="aim-label">Aim</span>
+    <svg class="aim-icon aim-icon-right" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M9 5L16 12L9 19" />
+    </svg>
+`;
 launchContainer.appendChild(dragZone);
 
 let isAiming = false;
@@ -128,7 +202,7 @@ dragZone.addEventListener('pointercancel', endAim);
 
 // Launch Button
 const launchBtn = document.createElement('button');
-launchBtn.textContent = 'GO!';
+launchBtn.textContent = 'Launch';
 launchBtn.className = 'launch-btn';
 launchContainer.appendChild(launchBtn);
 
@@ -328,6 +402,41 @@ Composite.add(engine.world, walls);
 const arenaGroup = new THREE.Group();
 scene.add(arenaGroup);
 
+function createWrappedArenaPlane(radius: number, radialSegments: number, angularSegments: number) {
+    const positions: number[] = [];
+    const indices: number[] = [];
+    const uvs: number[] = [];
+
+    for (let rIndex = 0; rIndex <= radialSegments; rIndex++) {
+        const r = (rIndex / radialSegments) * radius;
+        for (let aIndex = 0; aIndex <= angularSegments; aIndex++) {
+            const angle = (aIndex / angularSegments) * Math.PI * 2;
+            const x = Math.cos(angle) * r;
+            const z = Math.sin(angle) * r;
+            positions.push(x, getArenaHeight(x, z) + 0.35, z);
+            uvs.push(0.5 + x / (radius * 2), 0.5 + z / (radius * 2));
+        }
+    }
+
+    const rowSize = angularSegments + 1;
+    for (let rIndex = 0; rIndex < radialSegments; rIndex++) {
+        for (let aIndex = 0; aIndex < angularSegments; aIndex++) {
+            const a = rIndex * rowSize + aIndex;
+            const b = a + 1;
+            const c = (rIndex + 1) * rowSize + aIndex;
+            const d = c + 1;
+            indices.push(a, c, b, b, c, d);
+        }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+    return geometry;
+}
+
 // Bowl Floor (LatheGeometry)
 const profilePoints = [];
 const segments = 32;
@@ -341,17 +450,25 @@ profilePoints.push(new THREE.Vector2(ARENA_RADIUS + 10, BOWL_MAX_HEIGHT + 2));
 const floorGeometry = new THREE.LatheGeometry(profilePoints, 128); // Increased segments for smoothness
 floorGeometry.computeVertexNormals(); // Ensure smooth normals
 
-const floorMaterial = new THREE.MeshMatcapMaterial({
-    color: 0x111111,
+const floorMaterial = new THREE.MeshBasicMaterial({
+    color: 0x333333,
     side: THREE.DoubleSide
 });
 const floor = new THREE.Mesh(floorGeometry, floorMaterial);
 arenaGroup.add(floor);
 
+const arenaPlaneMaterial = new THREE.MeshBasicMaterial({
+    color: 0x222222,
+    side: THREE.DoubleSide
+});
+const arenaPlane = new THREE.Mesh(createWrappedArenaPlane(ARENA_RADIUS - 2, 28, 96), arenaPlaneMaterial);
+arenaPlane.renderOrder = 1;
+arenaGroup.add(arenaPlane);
+
 
 // Walls Visual (Ring at top)
 const wallGeometry = new THREE.RingGeometry(ARENA_RADIUS + 5, ARENA_RADIUS + 10, 100).translate(0, 0, -2);
-const wallMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+const wallMaterial = new THREE.MeshBasicMaterial({ color: 0x333333, side: THREE.DoubleSide });
 const wallMesh = new THREE.Mesh(wallGeometry, wallMaterial);
 wallMesh.rotation.x = Math.PI / 2;
 wallMesh.position.y = BOWL_MAX_HEIGHT;
@@ -364,6 +481,8 @@ arenaGroup.add(wallMesh);
 
 // Helper to create Beyblade 3D Model
 function createBeybladeMesh(stats: BeybladeStats): { mesh: THREE.Group, tiltGroup: THREE.Group, spinGroup: THREE.Group } {
+    enforceBeyColorContrast(stats);
+
     const mesh = new THREE.Group();
     const tiltGroup = new THREE.Group();
     const spinGroup = new THREE.Group();
@@ -375,11 +494,11 @@ function createBeybladeMesh(stats: BeybladeStats): { mesh: THREE.Group, tiltGrou
     spinGroup.scale.setScalar(stats.beyScale || 1.0);
 
     const pm = stats.partMatcaps || {};
-    const wheelTex = getMatcapTexture(pm.wheel);
-    const ringTex = getMatcapTexture(pm.ring);
-    const boltTex = getMatcapTexture(pm.bolt);
-    const trackTex = getMatcapTexture(pm.spinTrack);
-    const tipTex = getMatcapTexture(pm.tip);
+    const wheelTex = getMatcapTexture(getContrastMatcapUrl(pm.wheel));
+    const ringTex = getMatcapTexture(getContrastMatcapUrl(pm.ring));
+    const boltTex = getMatcapTexture(getContrastMatcapUrl(pm.bolt));
+    const trackTex = getMatcapTexture(getContrastMatcapUrl(pm.spinTrack));
+    const tipTex = getMatcapTexture(getContrastMatcapUrl(pm.tip));
 
     // Helper: Fake Smooth Normals
     const makeSmooth = (geo: THREE.BufferGeometry) => {
@@ -489,7 +608,7 @@ function createBeybladeMesh(stats: BeybladeStats): { mesh: THREE.Group, tiltGrou
     let spinTrackGeo: THREE.BufferGeometry = new THREE.CylinderGeometry(BEYBLADE_RADIUS * .3 * stSize, BEYBLADE_RADIUS * .2 * stSize, 10, 32);
     spinTrackGeo = makeSmooth(spinTrackGeo);
     const spinTrackMat = new THREE.MeshMatcapMaterial({
-        color: stats.spinTrackColor || 0x222222,
+        color: stats.spinTrackColor || 0x777777,
         matcap: trackTex
     });
     const spinTrack = new THREE.Mesh(spinTrackGeo, spinTrackMat);
@@ -507,7 +626,7 @@ function createBeybladeMesh(stats: BeybladeStats): { mesh: THREE.Group, tiltGrou
     tipGeo = makeSmooth(tipGeo);
 
     const tipMat = new THREE.MeshMatcapMaterial({
-        color: stats.tipColor || 0x333333,
+        color: stats.tipColor || 0x888888,
         matcap: tipTex
     });
     const tip = new THREE.Mesh(tipGeo, tipMat);
@@ -636,18 +755,19 @@ const entities: GameEntity[] = [];
 // Physics Constants
 // Physics Constants
 const FRICTION_LOW = 0.02;
-const FRICTION_HIGH = 0.1; // High Drag
+const FRICTION_HIGH = 0.035; // Controlled grip while diving
 
 const CRIT_SPEED_THRESHOLD = 20;
 const BARRIER_DAMAGE = 20; // Self-damage when hitting walls
+const DIVE_BOOST_FORCE = 0.00012;
 
 
 
 const DISH_LOW = 1;
-const DISH_HIGH = 5;
+const DISH_HIGH = 6;
 
 const CURL_LOW = 1;
-const CURL_HIGH = 100;
+const CURL_HIGH = 90;
 
 // Patterns
 interface PhysicsPattern {
@@ -658,11 +778,24 @@ interface PhysicsPattern {
 }
 
 const PATTERNS: PhysicsPattern[] = [
-    { name: 'EDGE', dish: DISH_LOW, curl: CURL_HIGH, drag: FRICTION_LOW }, // Aggressive Center (High Curl = Edge/Orbit)
-    { name: 'CENTER', dish: DISH_HIGH, curl: CURL_LOW, drag: FRICTION_HIGH }, // Heavy/Stable (High Dish = Center)
+    { name: 'ORBIT', dish: DISH_LOW, curl: CURL_HIGH, drag: FRICTION_LOW },
+    { name: 'DIVE', dish: DISH_HIGH, curl: CURL_LOW, drag: FRICTION_HIGH },
 ];
 
 let currentPatternIndex = 0;
+let cpuPatternIndex = 0;
+
+type TGameSpeedId = 'training' | 'arcade' | 'overdrive';
+
+const GAME_SPEEDS: Record<TGameSpeedId, { label: string, multiplier: number, copy: string }> = {
+    training: { label: 'Training', multiplier: 0.51, copy: 'Slow lesson pace' },
+    arcade: { label: 'Arcade', multiplier: 0.75, copy: 'Balanced match speed' },
+    overdrive: { label: 'Overdrive', multiplier: 0.96, copy: 'Faster impacts' }
+};
+
+let currentGameSpeed: TGameSpeedId = 'training';
+let tutorialComplete = localStorage.getItem('bblade_tutorial_complete') === 'true';
+let cpuNextDiveSwitchAt = 0;
 
 // --- Matcap Resources ---
 const MATCAP_ROOT = 'https://raw.githubusercontent.com/nidorx/matcaps/master/';
@@ -766,6 +899,13 @@ const textureCache: Record<string, THREE.Texture> = {};
 const defaultMatcapUrl = 'https://raw.githubusercontent.com/nidorx/matcaps/master/256/D5D5D5_929292_ACACAC_B4B4B4-256px.png';
 const textureLoader = new THREE.TextureLoader();
 const matcapTexture = textureLoader.load(defaultMatcapUrl);
+
+function getContrastMatcapUrl(url: string | undefined): string | undefined {
+    if (!url) return url;
+    const filename = decodeURIComponent(url.split('/').pop() || '').replace(/-[0-9]+px\.png$/, '.png');
+    return getMatcapCategory(filename) === 'Dark' ? defaultMatcapUrl : url;
+}
+
 function getMatcapTexture(url: string | undefined): THREE.Texture {
     if (!url) return matcapTexture; // Default ceramic
 
@@ -778,6 +918,238 @@ function getMatcapTexture(url: string | undefined): THREE.Texture {
 
 
 // Stats Presets
+type TPalette = {
+    name: string;
+    colors: [number, number, number, number, number];
+};
+
+type TBeyPreset = {
+    name: string;
+    style: string;
+    stats: Partial<BeybladeStats>;
+};
+
+type TRawBeyPreset = {
+    name: string;
+    style: string;
+    stats: Record<string, unknown>;
+};
+
+function matcapUrl(name: string) {
+    const nameWithoutExt = name.replace('.png', '');
+    return `${MATCAP_ROOT}256/${nameWithoutExt}-256px.png`;
+}
+
+const PRESET_MATCAP_SETS: Array<Required<BeybladeStats>['partMatcaps']> = [
+    {
+        wheel: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
+        ring: matcapUrl('0C0CC3_04049F_040483_04045C.png'),
+        bolt: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
+        spinTrack: matcapUrl('070B0C_B2C7CE_728FA3_5B748B.png'),
+        tip: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png')
+    },
+    {
+        wheel: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
+        ring: matcapUrl('0DBD0D_049704_047B04_045504.png'),
+        bolt: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
+        spinTrack: matcapUrl('0C430C_257D25_439A43_3C683C.png'),
+        tip: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png')
+    },
+    {
+        wheel: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
+        ring: matcapUrl('0D0DE3_040486_0404AF_0404CF.png'),
+        bolt: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png'),
+        spinTrack: matcapUrl('0F990F_047B04_044604_046704.png'),
+        tip: matcapUrl('D5D5D5_929292_ACACAC_B4B4B4.png')
+    }
+];
+
+const CURATED_PALETTES: TPalette[] = [
+    { name: 'Prize Cabinet', colors: [0xfff12b, 0x05d9ff, 0xff2bd6, 0x10131f, 0xffffff] },
+    { name: 'Vapor Chrome', colors: [0x79ffe1, 0x6d5dfc, 0xff7ac8, 0x1b1f3a, 0xf3f7ff] },
+    { name: 'Solar Punch', colors: [0xffb000, 0xff4d00, 0x2ff3e0, 0x111111, 0xfff7d6] },
+    { name: 'Circuit Jade', colors: [0x39ff88, 0x00b8ff, 0xfff12b, 0x0b1020, 0xeafff4] },
+    { name: 'Candy Steel', colors: [0xf72585, 0x4cc9f0, 0xb5179e, 0x161a2d, 0xf8f9fb] }
+];
+
+const BEY_PRESET_CONFIGS_JSON = `[
+  {"name":"Jackpot Volt","style":"crit sprinter","stats":{"atk":13,"def":4,"sta":1.1,"spd":72,"wt":0.9,"crtAtk":30,"beyScale":0.96,"wheelColor":"#18090b","ringColor":"#ff243e","boltColor":"#ffd21a","spinTrackColor":"#2ec7ff","tipColor":"#fff8ed","ringRadiusFactor":0.78,"ringSides":48,"boltSides":6}},
+  {"name":"Storm Pegasus","style":"wide attack","stats":{"atk":12,"def":5,"sta":1.0,"spd":74,"wt":0.94,"crtAtk":29,"beyScale":0.98,"wheelColor":"#12315a","ringColor":"#2ec7ff","boltColor":"#fff8ed","spinTrackColor":"#ff243e","tipColor":"#ffd21a","ringRadiusFactor":0.82,"ringSides":64,"boltSides":5}},
+  {"name":"Inferno Bull","style":"heavy burst","stats":{"atk":11,"def":8,"sta":1.3,"spd":56,"wt":1.34,"crtAtk":27,"beyScale":1.08,"wheelColor":"#240b0d","ringColor":"#ff7a12","boltColor":"#ff243e","spinTrackColor":"#ffd21a","tipColor":"#fff8ed","ringRadiusFactor":0.86,"ringSides":32,"boltSides":8}},
+  {"name":"Aqua Leone","style":"guard counter","stats":{"atk":8,"def":9,"sta":1.5,"spd":58,"wt":1.22,"crtAtk":22,"beyScale":1.04,"wheelColor":"#0b1722","ringColor":"#2ec7ff","boltColor":"#a736ff","spinTrackColor":"#fff8ed","tipColor":"#ffd21a","ringRadiusFactor":0.8,"ringSides":40,"boltSides":6}},
+  {"name":"Solar Wyvern","style":"stamina arc","stats":{"atk":9,"def":6,"sta":1.8,"spd":61,"wt":1.05,"crtAtk":24,"beyScale":1.0,"wheelColor":"#23150a","ringColor":"#ffd21a","boltColor":"#ff7a12","spinTrackColor":"#fff8ed","tipColor":"#ff243e","ringRadiusFactor":0.74,"ringSides":48,"boltSides":6}},
+  {"name":"Violet Lynx","style":"orbit control","stats":{"atk":10,"def":6,"sta":1.2,"spd":68,"wt":1.0,"crtAtk":26,"beyScale":0.99,"wheelColor":"#170d24","ringColor":"#a736ff","boltColor":"#2ec7ff","spinTrackColor":"#ff243e","tipColor":"#fff8ed","ringRadiusFactor":0.72,"ringSides":64,"boltSides":5}},
+  {"name":"Crimson Eagle","style":"air dash","stats":{"atk":13,"def":5,"sta":0.95,"spd":76,"wt":0.92,"crtAtk":31,"beyScale":0.95,"wheelColor":"#160914","ringColor":"#ff243e","boltColor":"#fff8ed","spinTrackColor":"#ff7a12","tipColor":"#2ec7ff","ringRadiusFactor":0.76,"ringSides":56,"boltSides":6}},
+  {"name":"Chrome Kraken","style":"dense defense","stats":{"atk":8,"def":10,"sta":1.45,"spd":50,"wt":1.42,"crtAtk":21,"beyScale":1.09,"wheelColor":"#d7dde5","ringColor":"#1d2730","boltColor":"#2ec7ff","spinTrackColor":"#ff7a12","tipColor":"#ffd21a","ringRadiusFactor":0.88,"ringSides":32,"boltSides":8}},
+  {"name":"Nova Fox","style":"balanced burst","stats":{"atk":11,"def":6,"sta":1.25,"spd":65,"wt":1.05,"crtAtk":27,"beyScale":1.0,"wheelColor":"#1a1212","ringColor":"#ff7a12","boltColor":"#ffd21a","spinTrackColor":"#2ec7ff","tipColor":"#fff8ed","ringRadiusFactor":0.8,"ringSides":48,"boltSides":6}},
+  {"name":"Thunder Roc","style":"impact tank","stats":{"atk":12,"def":8,"sta":1.15,"spd":54,"wt":1.32,"crtAtk":30,"beyScale":1.07,"wheelColor":"#23140a","ringColor":"#ffd21a","boltColor":"#ff243e","spinTrackColor":"#a736ff","tipColor":"#fff8ed","ringRadiusFactor":0.84,"ringSides":40,"boltSides":8}},
+  {"name":"Blizzard Hare","style":"light drift","stats":{"atk":9,"def":5,"sta":1.55,"spd":73,"wt":0.86,"crtAtk":23,"beyScale":0.94,"wheelColor":"#eef8ff","ringColor":"#2ec7ff","boltColor":"#a736ff","spinTrackColor":"#fff8ed","tipColor":"#ff243e","ringRadiusFactor":0.7,"ringSides":64,"boltSides":5}},
+  {"name":"Magma Serpent","style":"wall bite","stats":{"atk":12,"def":7,"sta":1.05,"spd":62,"wt":1.16,"crtAtk":29,"beyScale":1.02,"wheelColor":"#190707","ringColor":"#ff243e","boltColor":"#ff7a12","spinTrackColor":"#ffd21a","tipColor":"#fff8ed","ringRadiusFactor":0.82,"ringSides":36,"boltSides":6}},
+  {"name":"Comet Panda","style":"stamina guard","stats":{"atk":7,"def":8,"sta":1.9,"spd":52,"wt":1.18,"crtAtk":20,"beyScale":1.05,"wheelColor":"#fff8ed","ringColor":"#160914","boltColor":"#ffd21a","spinTrackColor":"#2ec7ff","tipColor":"#ff243e","ringRadiusFactor":0.76,"ringSides":48,"boltSides":8}},
+  {"name":"Azure Dragon","style":"fast curve","stats":{"atk":11,"def":5,"sta":1.2,"spd":75,"wt":0.96,"crtAtk":28,"beyScale":0.98,"wheelColor":"#07121f","ringColor":"#2ec7ff","boltColor":"#ffd21a","spinTrackColor":"#a736ff","tipColor":"#fff8ed","ringRadiusFactor":0.74,"ringSides":56,"boltSides":5}},
+  {"name":"Ember Tiger","style":"crit brawler","stats":{"atk":14,"def":4,"sta":0.9,"spd":69,"wt":1.02,"crtAtk":33,"beyScale":1.0,"wheelColor":"#240908","ringColor":"#ff7a12","boltColor":"#ff243e","spinTrackColor":"#fff8ed","tipColor":"#ffd21a","ringRadiusFactor":0.78,"ringSides":44,"boltSides":6}},
+  {"name":"Ghost Mantis","style":"precision edge","stats":{"atk":10,"def":6,"sta":1.35,"spd":70,"wt":0.98,"crtAtk":25,"beyScale":0.97,"wheelColor":"#fff8ed","ringColor":"#a736ff","boltColor":"#2ec7ff","spinTrackColor":"#160914","tipColor":"#ffd21a","ringRadiusFactor":0.68,"ringSides":64,"boltSides":5}},
+  {"name":"Iron Rhino","style":"slow crusher","stats":{"atk":10,"def":11,"sta":1.25,"spd":46,"wt":1.5,"crtAtk":26,"beyScale":1.1,"wheelColor":"#2b2f35","ringColor":"#ff243e","boltColor":"#ffd21a","spinTrackColor":"#fff8ed","tipColor":"#2ec7ff","ringRadiusFactor":0.9,"ringSides":32,"boltSides":8}},
+  {"name":"Pulse Phoenix","style":"comeback spin","stats":{"atk":11,"def":7,"sta":1.45,"spd":64,"wt":1.08,"crtAtk":28,"beyScale":1.03,"wheelColor":"#170814","ringColor":"#ff243e","boltColor":"#ffd21a","spinTrackColor":"#ff7a12","tipColor":"#2ec7ff","ringRadiusFactor":0.8,"ringSides":48,"boltSides":6}}
+]`;
+
+const COLOR_STAT_KEYS = new Set(['wheelColor', 'ringColor', 'boltColor', 'spinTrackColor', 'tipColor', 'trailColor']);
+const BEY_COLOR_KEYS: Array<keyof Pick<BeybladeStats, 'wheelColor' | 'ringColor' | 'boltColor' | 'spinTrackColor' | 'tipColor' | 'trailColor'>> = [
+    'wheelColor',
+    'ringColor',
+    'boltColor',
+    'spinTrackColor',
+    'tipColor',
+    'trailColor'
+];
+const MIN_BEY_LUMA = 135;
+
+function getColorLuma(color: number) {
+    const r = (color >> 16) & 255;
+    const g = (color >> 8) & 255;
+    const b = color & 255;
+    return (r * 0.299) + (g * 0.587) + (b * 0.114);
+}
+
+function clampBeyColor(color: number) {
+    const normalized = Math.max(0, Math.min(0xffffff, Math.round(color || 0)));
+    const luma = getColorLuma(normalized);
+    if (luma >= MIN_BEY_LUMA) return normalized;
+
+    const r = (normalized >> 16) & 255;
+    const g = (normalized >> 8) & 255;
+    const b = normalized & 255;
+    const mix = Math.min(1, (MIN_BEY_LUMA - luma) / Math.max(1, 255 - luma));
+
+    return ((Math.round(r + (255 - r) * mix) << 16) |
+        (Math.round(g + (255 - g) * mix) << 8) |
+        Math.round(b + (255 - b) * mix));
+}
+
+function enforceBeyColorContrast(stats: Partial<BeybladeStats>) {
+    BEY_COLOR_KEYS.forEach((key) => {
+        const value = stats[key];
+        if (typeof value === 'number') {
+            (stats as any)[key] = clampBeyColor(value);
+        }
+    });
+}
+
+function normalizePresetConfig(config: TRawBeyPreset, index: number): TBeyPreset {
+    const stats: Record<string, unknown> = {};
+    Object.entries(config.stats).forEach(([key, value]) => {
+        stats[key] = COLOR_STAT_KEYS.has(key) && typeof value === 'string'
+            ? parseInt(value.replace('#', ''), 16)
+            : value;
+    });
+    stats.partMatcaps = PRESET_MATCAP_SETS[index % PRESET_MATCAP_SETS.length];
+    enforceBeyColorContrast(stats as Partial<BeybladeStats>);
+    return {
+        name: config.name,
+        style: config.style,
+        stats: stats as Partial<BeybladeStats>
+    };
+}
+
+const BEY_PRESETS = (JSON.parse(BEY_PRESET_CONFIGS_JSON) as TRawBeyPreset[]).map(normalizePresetConfig);
+
+function applyPaletteToStats(stats: BeybladeStats, palette: TPalette) {
+    const [primary, secondary, accent, shadow, light] = palette.colors;
+    stats.wheelColor = shadow;
+    stats.ringColor = primary;
+    stats.boltColor = accent;
+    stats.spinTrackColor = secondary;
+    stats.tipColor = light;
+    stats.trailColor = accent;
+    enforceBeyColorContrast(stats);
+}
+
+function randomFromRange(min: number, max: number) {
+    return min + Math.random() * (max - min);
+}
+
+function numberToHex(value: number) {
+    return value.toString(16).padStart(6, '0');
+}
+
+function hslToHex(h: number, s: number, l: number) {
+    const saturation = s / 100;
+    const lightness = l / 100;
+    const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
+    const x = chroma * (1 - Math.abs((h / 60) % 2 - 1));
+    const m = lightness - chroma / 2;
+    let r = 0;
+    let g = 0;
+    let b = 0;
+
+    if (h < 60) [r, g, b] = [chroma, x, 0];
+    else if (h < 120) [r, g, b] = [x, chroma, 0];
+    else if (h < 180) [r, g, b] = [0, chroma, x];
+    else if (h < 240) [r, g, b] = [0, x, chroma];
+    else if (h < 300) [r, g, b] = [x, 0, chroma];
+    else [r, g, b] = [chroma, 0, x];
+
+    return ((Math.round((r + m) * 255) << 16) |
+        (Math.round((g + m) * 255) << 8) |
+        Math.round((b + m) * 255));
+}
+
+async function fetchProfessionalPalette(): Promise<TPalette> {
+    const baseHue = Math.floor(Math.random() * 360);
+    const sourceColors = [
+        hslToHex(baseHue, 88, 54),
+        hslToHex((baseHue + 32) % 360, 92, 48),
+        hslToHex((baseHue + 174) % 360, 86, 58),
+        hslToHex((baseHue + 248) % 360, 76, 18),
+        hslToHex((baseHue + 54) % 360, 80, 92)
+    ];
+    const response = await fetch(`https://api.color.pizza/v1/?values=${sourceColors.map(numberToHex).join(',')}`);
+    const data = await response.json() as {
+        colors?: Array<{ hex?: string }>;
+    };
+    const colors = data.colors
+        ?.map(color => color.hex?.replace('#', ''))
+        .filter((hex): hex is string => Boolean(hex))
+        .map(hex => parseInt(hex, 16));
+
+    if (!colors || colors.length < 5) {
+        throw new Error('Palette service did not return enough colors');
+    }
+
+    return {
+        name: 'Color Pizza Harmony',
+        colors: [colors[0], colors[1], colors[2], colors[3], colors[4]]
+    };
+}
+
+async function buildRandomBeyStats(baseStats: BeybladeStats): Promise<BeybladeStats> {
+    const nextStats = JSON.parse(JSON.stringify(baseStats)) as BeybladeStats;
+    let palette = CURATED_PALETTES[Math.floor(Math.random() * CURATED_PALETTES.length)];
+
+    try {
+        palette = await fetchProfessionalPalette();
+    } catch (error) {
+        console.info('Using curated palette fallback:', error);
+    }
+
+    applyPaletteToStats(nextStats, palette);
+    nextStats.atk = Math.round(randomFromRange(8, 14));
+    nextStats.def = Math.round(randomFromRange(4, 9));
+    nextStats.sta = Number(randomFromRange(0.8, 1.6).toFixed(1));
+    nextStats.spd = Math.round(randomFromRange(52, 76));
+    nextStats.wt = Number(randomFromRange(0.85, 1.35).toFixed(2));
+    nextStats.crtAtk = Math.round(nextStats.atk * randomFromRange(2.0, 2.7));
+    nextStats.beyScale = Number(randomFromRange(0.94, 1.08).toFixed(2));
+    nextStats.ringRadiusFactor = Number(randomFromRange(0.68, 0.86).toFixed(2));
+    nextStats.ringSides = [24, 32, 40, 48, 64][Math.floor(Math.random() * 5)];
+    nextStats.boltSides = [5, 6, 8][Math.floor(Math.random() * 3)];
+    nextStats.spinTrackSize = Number(randomFromRange(0.85, 1.18).toFixed(2));
+    nextStats.tipSize = Number(randomFromRange(0.85, 1.15).toFixed(2));
+    enforceBeyColorContrast(nextStats);
+
+    return nextStats;
+}
+
 const PLAYER_STATS: BeybladeStats = {
     maxRpm: 1000,
     atk: 10,
@@ -801,11 +1173,11 @@ const PLAYER_STATS: BeybladeStats = {
     ringRadiusFactor: 0.75,
     boltColor: 0x00ccff, // Cyan
     boltSides: 6,
-    spinTrackColor: 0x222222,
+    spinTrackColor: 0x777777,
     spinTrackSize: 1.0,
-    tipColor: 0x333333,
+    tipColor: 0x888888,
     tipSize: 1.0,
-    trailColor: 0x00ffff, // Default Cyan
+    trailColor: 0x00ccff,
     // Arena Forces
     dishForce: 2, // DISH_LOW
     curlForce: 1, // CURL_LOW
@@ -836,11 +1208,11 @@ const ENEMY_STATS: BeybladeStats = {
     ringRadiusFactor: 0.75,
     boltColor: 0xffaa00, // Gold
     boltSides: 6,
-    spinTrackColor: 0x222222,
+    spinTrackColor: 0x777777,
     spinTrackSize: 1.0,
-    tipColor: 0x333333,
+    tipColor: 0x888888,
     tipSize: 1.0,
-    trailColor: 0x00ffff, // Main Cyan
+    trailColor: 0xffaa00,
     // Arena Forces
     dishForce: 2, // DISH_LOW
     curlForce: 1, // CURL_LOW
@@ -851,7 +1223,15 @@ const ENEMY_STATS: BeybladeStats = {
 const DEFAULT_PLAYER_STATS = JSON.parse(JSON.stringify(PLAYER_STATS));
 const DEFAULT_ENEMY_STATS = JSON.parse(JSON.stringify(ENEMY_STATS));
 
+function syncTrailWithBolt(stats: BeybladeStats) {
+    stats.trailColor = stats.boltColor;
+}
+
 function savePresets() {
+    syncTrailWithBolt(PLAYER_STATS);
+    syncTrailWithBolt(ENEMY_STATS);
+    enforceBeyColorContrast(PLAYER_STATS);
+    enforceBeyColorContrast(ENEMY_STATS);
     localStorage.setItem('bblade_player_stats', JSON.stringify(PLAYER_STATS));
     localStorage.setItem('bblade_enemy_stats', JSON.stringify(ENEMY_STATS));
 }
@@ -862,11 +1242,15 @@ function loadPresets() {
         // Merge with default to ensure new fields are present
         const parsed = JSON.parse(pData);
         Object.assign(PLAYER_STATS, { ...DEFAULT_PLAYER_STATS, ...parsed });
+        if (!parsed.trailColor || parsed.trailColor === 0x00ffff) syncTrailWithBolt(PLAYER_STATS);
+        enforceBeyColorContrast(PLAYER_STATS);
     }
     const eData = localStorage.getItem('bblade_enemy_stats');
     if (eData) {
         const parsed = JSON.parse(eData);
         Object.assign(ENEMY_STATS, { ...DEFAULT_ENEMY_STATS, ...parsed });
+        if (!parsed.trailColor || parsed.trailColor === 0x00ffff) syncTrailWithBolt(ENEMY_STATS);
+        enforceBeyColorContrast(ENEMY_STATS);
     }
 }
 
@@ -885,7 +1269,15 @@ const VISUAL_FIELDS = [
     { key: 'spinTrackSize', label: 'ST SIZE', hint: 'Track depth', type: 'number', step: 0.1 },
     { key: 'tipColor', label: 'TIP', hint: 'Hex', type: 'color' },
     { key: 'tipSize', label: 'TIP SIZE', hint: 'Radius', type: 'number', step: 0.1 },
-    { key: 'trailColor', label: 'TRAIL', hint: 'Hex', type: 'color' },
+];
+
+const COMBAT_FIELDS = [
+    { key: 'atk', label: 'ATTACK', hint: 'Damage', type: 'number', step: 1 },
+    { key: 'def', label: 'DEFENSE', hint: 'Resistance', type: 'number', step: 1 },
+    { key: 'sta', label: 'STAMINA', hint: 'Endurance', type: 'number', step: 1 },
+    { key: 'spd', label: 'SPEED', hint: 'Velocity', type: 'number', step: 1 },
+    { key: 'wt', label: 'WEIGHT', hint: 'Mass', type: 'number', step: 0.1 },
+    { key: 'crtAtk', label: 'CRIT ATK', hint: 'Crit Dmg', type: 'number', step: 1 },
 ];
 
 function createBeyblade(x: number, y: number, stats: BeybladeStats): GameEntity {
@@ -928,7 +1320,7 @@ const player = createBeyblade(0, 100, PLAYER_STATS);
 const enemy = createBeyblade(0, -100, ENEMY_STATS);
 
 // Initial Guide Update
-updateGuide(0);
+updateGuide(currentLaunchAngle.value);
 
 // Trigger once logic moved to setup
 
@@ -966,15 +1358,19 @@ const hudTopBar = document.createElement('div');
 hudTopBar.id = 'hud-top-bar';
 hudTopBar.innerHTML = `
     <div class="hud-group">
-        <button class="rpm-label" id="p1-btn" style="cursor: pointer; text-decoration: underline;">P1</button>
-        <span id="player-rpm" class="rpm-text">0</span>
-        <meter id="player-meter" min="0" max="1000" low="200" high="800" optimum="1000" value="0"></meter>
+        <button class="rpm-label" id="p1-btn" title="Customize player">P1</button>
+        <div class="rpm-meter-wrap">
+            <meter id="player-meter" min="0" max="1000" low="200" high="800" optimum="1000" value="0" aria-label="P1 RPM"></meter>
+            <span id="player-rpm" class="rpm-text">0</span>
+        </div>
     </div>
     <div class="hud-divider">VS</div>
     <div class="hud-group">
-        <meter id="enemy-meter" min="0" max="1000" low="200" high="800" optimum="1000" value="0" style="transform: scaleX(-1);"></meter>
-        <span id="enemy-rpm" class="rpm-text">0</span>
-        <button class="rpm-label" id="cpu-btn" style="cursor: pointer; text-decoration: underline;">CPU</button>
+        <div class="rpm-meter-wrap">
+            <meter id="enemy-meter" min="0" max="1000" low="200" high="800" optimum="1000" value="0" aria-label="CPU RPM" style="transform: scaleX(-1);"></meter>
+            <span id="enemy-rpm" class="rpm-text">0</span>
+        </div>
+        <button class="rpm-label" id="cpu-btn" title="Customize CPU">CPU</button>
     </div>
 `;
 uiContainer.appendChild(hudTopBar);
@@ -1013,6 +1409,35 @@ function updatePhysicsFromPattern() {
     player.stats.frictionAir = p.drag;
 }
 
+function updateCpuPhysicsFromPattern() {
+    if (!enemy || !enemy.body || !enemy.stats) return;
+
+    const p = PATTERNS[cpuPatternIndex];
+    enemy.stats.dishForce = p.dish;
+    enemy.stats.curlForce = p.curl;
+    enemy.body.frictionAir = p.drag;
+    enemy.stats.frictionAir = p.drag;
+}
+
+function scheduleNextCpuDiveSwitch(now: number) {
+    cpuNextDiveSwitchAt = now + randomFromRange(0.85, 2.2);
+}
+
+function setCpuPattern(pattern: number) {
+    cpuPatternIndex = pattern;
+    updateCpuPhysicsFromPattern();
+}
+
+function updateCpuDive(now: number) {
+    if (!hasLaunched || gameOver) return;
+    if (now < cpuNextDiveSwitchAt) return;
+
+    const playerIsDiving = currentPatternIndex === 1;
+    const diveChance = playerIsDiving ? 0.62 : 0.38;
+    setCpuPattern(Math.random() < diveChance ? 1 : 0);
+    scheduleNextCpuDiveSwitch(now);
+}
+
 // Dive Logic
 const setPattern = (e: Event | null, pattern: number) => {
     if (e) e.preventDefault(); // Prevent ghost clicks
@@ -1039,7 +1464,7 @@ const cycleBtn = document.createElement('button');
 cycleBtn.className = 'pattern-btn';
 currentPatternIndex = 0;
 cycleBtn.innerHTML = `
-    <span class="value">DIVE</span>
+    <span class="value">Dive</span>
 `;
 
 // Event Listeners for Button
@@ -1054,6 +1479,7 @@ cycleBtnContainer.appendChild(cycleBtn);
 
 // Init Physics
 updatePhysicsFromPattern();
+updateCpuPhysicsFromPattern();
 
 const playerRpmEl = document.getElementById('player-rpm')!;
 const enemyRpmEl = document.getElementById('enemy-rpm')!;
@@ -1096,7 +1522,7 @@ function createSpark(x: number, y: number, color: number, speedVal: number) {
     sparks.push({ mesh, velocity, life: 1.0 });
 }
 
-// --- Audio System (Keep same) ---
+// --- Audio System ---
 const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
 
 // Create a noise buffer once
@@ -1107,7 +1533,82 @@ for (let i = 0; i < bufferSize; i++) {
     data[i] = Math.random() * 2 - 1;
 }
 
-function playCollisionSound(intensity: number, baseFrequency: number) {
+function createReverbImpulse(seconds: number, decay: number) {
+    const length = Math.floor(audioCtx.sampleRate * seconds);
+    const impulse = audioCtx.createBuffer(2, length, audioCtx.sampleRate);
+
+    for (let channel = 0; channel < impulse.numberOfChannels; channel++) {
+        const channelData = impulse.getChannelData(channel);
+        for (let i = 0; i < length; i++) {
+            const progress = i / length;
+            channelData[i] = (Math.random() * 2 - 1) * Math.pow(1 - progress, decay);
+        }
+    }
+
+    return impulse;
+}
+
+const criticalReverbImpulse = createReverbImpulse(1.45, 2.4);
+
+function getCollisionWorldPoint(pair: Matter.Pair) {
+    const supports = pair.collision.supports;
+    if (!supports.length) return undefined;
+
+    const point = supports.reduce(
+        (acc, support) => {
+            acc.x += support.x;
+            acc.y += support.y;
+            return acc;
+        },
+        { x: 0, y: 0 }
+    );
+    const x = point.x / supports.length;
+    const z = point.y / supports.length;
+
+    return new THREE.Vector3(x, getArenaHeight(x, z) + 18, z);
+}
+
+function updateCriticalFlashOrigin() {
+    const worldPoint = criticalFlashState.worldPoint;
+    if (worldPoint) {
+        const projected = worldPoint.clone().project(camera);
+        if (Number.isFinite(projected.x) && Number.isFinite(projected.y)) {
+            criticalFlashUniforms.uOrigin.value.set(
+                THREE.MathUtils.clamp((projected.x + 1) * 0.5, 0, 1),
+                THREE.MathUtils.clamp((projected.y + 1) * 0.5, 0, 1)
+            );
+        }
+    } else {
+        criticalFlashUniforms.uOrigin.value.set(0.5, 0.5);
+    }
+}
+
+function triggerCriticalFeedback(worldPoint?: THREE.Vector3) {
+    criticalFlashState.worldPoint = worldPoint?.clone();
+    camera.updateMatrixWorld(true);
+    updateCriticalFlashOrigin();
+    criticalFlashState.startedAt = clock.getElapsedTime();
+    criticalFlashUniforms.uIntensity.value = 1.22;
+    criticalFlashPlane.visible = true;
+}
+
+function updateCriticalFlash() {
+    if (!criticalFlashPlane.visible) return;
+
+    updateCriticalFlashOrigin();
+    const elapsed = clock.getElapsedTime() - criticalFlashState.startedAt;
+    if (elapsed < 0.018) {
+        criticalFlashUniforms.uIntensity.value = 1.22;
+        return;
+    }
+
+    const progress = THREE.MathUtils.clamp((elapsed - 0.018) / criticalFlashState.duration, 0, 1);
+    const fade = Math.pow(1 - progress, 3.2);
+    criticalFlashUniforms.uIntensity.value = fade * 1.22;
+    criticalFlashPlane.visible = fade > 0.01;
+}
+
+function playCollisionSound(intensity: number, baseFrequency: number, isCritical = false) {
     if (audioCtx.state === 'suspended') {
         audioCtx.resume();
     }
@@ -1117,45 +1618,77 @@ function playCollisionSound(intensity: number, baseFrequency: number) {
     masterGain.connect(audioCtx.destination);
     masterGain.gain.setValueAtTime(intensity, t);
 
+    if (isCritical) {
+        const convolver = audioCtx.createConvolver();
+        const reverbTone = audioCtx.createBiquadFilter();
+        const reverbGain = audioCtx.createGain();
+        const slapDelay = audioCtx.createDelay(0.25);
+        const feedback = audioCtx.createGain();
+        const wetGain = audioCtx.createGain();
+        const tone = audioCtx.createBiquadFilter();
+
+        convolver.buffer = criticalReverbImpulse;
+        reverbTone.type = 'lowpass';
+        reverbTone.frequency.setValueAtTime(3600, t);
+        reverbGain.gain.setValueAtTime(0.72, t);
+
+        slapDelay.delayTime.setValueAtTime(0.088, t);
+        feedback.gain.setValueAtTime(0.62, t);
+        wetGain.gain.setValueAtTime(0.64, t);
+        tone.type = 'lowpass';
+        tone.frequency.setValueAtTime(3400, t);
+
+        masterGain.connect(convolver);
+        convolver.connect(reverbTone);
+        reverbTone.connect(reverbGain);
+        reverbGain.connect(audioCtx.destination);
+        masterGain.connect(slapDelay);
+        slapDelay.connect(feedback);
+        feedback.connect(slapDelay);
+        slapDelay.connect(tone);
+        tone.connect(wetGain);
+        wetGain.connect(audioCtx.destination);
+    }
+
     // 1. Impact "Thud"
     const noise = audioCtx.createBufferSource();
     noise.buffer = noiseBuffer;
     const noiseFilter = audioCtx.createBiquadFilter();
     noiseFilter.type = 'highpass';
-    noiseFilter.frequency.value = 100;
+    noiseFilter.frequency.value = isCritical ? 900 : 100;
     const noiseGain = audioCtx.createGain();
 
     noise.connect(noiseFilter);
     noiseFilter.connect(noiseGain);
     noiseGain.connect(masterGain);
 
-    noiseGain.gain.setValueAtTime(0.7, t);
-    noiseGain.gain.exponentialRampToValueAtTime(0.025, t + 0.1);
+    noiseGain.gain.setValueAtTime(isCritical ? 0.95 : 0.7, t);
+    noiseGain.gain.exponentialRampToValueAtTime(0.025, t + (isCritical ? 0.045 : 0.1));
     noise.start(t);
-    noise.stop(t + 0.1);
+    noise.stop(t + (isCritical ? 0.055 : 0.1));
 
     // 2. Heavy Metal Clang
-    const scale = [1, 3 / 2, 5 / 4, 7 / 4, 2];
+    const scale = isCritical ? [1, 1.25, 1.5, 2] : [1, 3 / 2, 5 / 4, 7 / 4, 2];
     const pick = Math.floor(Math.random() * scale.length);
-    // Use the passed baseFrequency instead of calculating from 200 constant
-    // But keep the scale variation? user passed 200/400/100, so we can treat that as the "200" in original code
     const baseFreq = baseFrequency * scale[pick];
-    const ratios = [1, 1.5, 2.0, 2.5];
+    const ratios = isCritical ? [1, 2.15, 3.05, 4.6] : [1, 1.5, 2.0, 2.5];
 
     ratios.forEach((ratio, index) => {
         const osc = audioCtx.createOscillator();
         const oscGain = audioCtx.createGain();
 
-        osc.type = index % 2 == 0 ? 'square' : 'triangle';
+        osc.type = isCritical ? 'square' : index % 2 == 0 ? 'square' : 'triangle';
         osc.frequency.setValueAtTime(baseFreq * ratio, t);
 
         osc.connect(oscGain);
         oscGain.connect(masterGain);
 
         oscGain.gain.setValueAtTime(0.0, t);
-        oscGain.gain.linearRampToValueAtTime(0.6 / (index + 0.8), t + 0.002);
+        oscGain.gain.linearRampToValueAtTime((isCritical ? 0.42 : 0.6) / (index + 0.8), t + 0.002);
 
-        const decayDuration = 0.3 + (Math.random() * 0.2) + (1.0 / (index + 1)) * 0.5;
+        const decayDuration = isCritical
+            ? 0.065 + (Math.random() * 0.035) + (1.0 / (index + 1)) * 0.055
+            : 0.3 + (Math.random() * 0.2) + (1.0 / (index + 1)) * 0.5;
         oscGain.gain.exponentialRampToValueAtTime(0.001, t + decayDuration);
 
         osc.start(t);
@@ -1195,8 +1728,9 @@ Events.on(engine, 'collisionStart', (event) => {
             // Sparks & Sound
             const isHighSpeed = isCritA || isCritB;
 
-            const count = isHighSpeed ? 15 : 3;
-            const speed = isHighSpeed ? 5 : 2;
+            const count = isHighSpeed ? 24 : 3;
+            const speed = isHighSpeed ? 9 : 2;
+            const criticalFlashPoint = getCollisionWorldPoint(pair);
 
             if (pair.collision.supports.length > 0) {
                 const { x, y } = pair.collision.supports[0];
@@ -1208,11 +1742,18 @@ Events.on(engine, 'collisionStart', (event) => {
                     if (!isCritA && !isCritB)
                         createSpark(x, y, 0xaaaaaa, speed);
                 }
+                if (isHighSpeed) {
+                    for (let i = 0; i < 10; i++) {
+                        createSpark(x, y, 0xffffff, speed + 3);
+                    }
+                }
             }
-            if (isHighSpeed)
-                playCollisionSound(0.5, 400); // High Pitch
-            else
+            if (isHighSpeed) {
+                triggerCriticalFeedback(criticalFlashPoint);
+                playCollisionSound(0.34, 675, true);
+            } else {
                 playCollisionSound(0.2, 200); // Normal Pitch
+            }
         } else {
             // Fallback / Wall hits
             // If one is a Beyblade and the other is not (Environment), apply Barrier Damage
@@ -1250,7 +1791,9 @@ function animate() {
     requestAnimationFrame(animate);
 
     // Physics Update
-    const subStepDelta = (1000 / 60) / SUBSTEPS;
+    const speedMultiplier = GAME_SPEEDS[currentGameSpeed].multiplier;
+    const subStepDelta = ((1000 / 60) * speedMultiplier) / SUBSTEPS;
+    updateCpuDive(clock.getElapsedTime());
     for (let i = 0; i < SUBSTEPS; i++) {
         Engine.update(engine, subStepDelta);
 
@@ -1276,8 +1819,9 @@ function animate() {
                     }
 
                     // Normalized radial direction (toward center)
-                    const radialX = -px / dist;
-                    const radialY = -py / dist;
+                    const safeDist = Math.max(dist, 1);
+                    const radialX = -px / safeDist;
+                    const radialY = -py / safeDist;
 
 
                     // Tangent direction (perpendicular, clockwise)
@@ -1288,14 +1832,22 @@ function animate() {
                     if (entity.currentRpm === undefined) return;
                     // const life = entity.currentRpm / entity.stats.maxRpm;
                     // Calculate force magnitudes
-                    const dishMagnitude = FORCE_CONSTANT * entity.body.mass * dist * entity.stats.dishForce;
-                    const curlMagnitude = FORCE_CONSTANT * entity.body.mass * (1 - dist / ARENA_RADIUS) * entity.stats.curlForce;
+                    const dishMagnitude = FORCE_CONSTANT * entity.body.mass * safeDist * entity.stats.dishForce;
+                    const curlMagnitude = FORCE_CONSTANT * entity.body.mass * (1 - safeDist / ARENA_RADIUS) * entity.stats.curlForce;
 
                     // Apply combined force
                     Body.applyForce(entity.body, entity.body.position, {
                         x: radialX * dishMagnitude + tangentX * curlMagnitude,
                         y: radialY * dishMagnitude + tangentY * curlMagnitude
                     });
+
+                    const isDiving = (entity === player && currentPatternIndex === 1) || (entity === enemy && cpuPatternIndex === 1);
+                    if (isDiving && speed > 0.1) {
+                        Body.applyForce(entity.body, entity.body.position, {
+                            x: (entity.body.velocity.x / speed) * DIVE_BOOST_FORCE * entity.body.mass,
+                            y: (entity.body.velocity.y / speed) * DIVE_BOOST_FORCE * entity.body.mass
+                        });
+                    }
                 }
             });
         }
@@ -1506,10 +2058,14 @@ function animate() {
         if (enemyMeterEl && enemyMeterEl.value !== enemyRpm) {
             enemyMeterEl.value = enemyRpm;
         }
+        playerMeterEl.title = `P1 RPM ${playerRpm}`;
+        enemyMeterEl.title = `CPU RPM ${enemyRpm}`;
+
     }
 
     // Update controls
     controls.update();
+    syncCriticalFlashPlaneToCamera();
 
     if (!hasLaunched) {
         const angle = currentLaunchAngle.value;
@@ -1521,6 +2077,7 @@ function animate() {
         launchContainer.style.display = 'none';
     }
 
+    updateCriticalFlash();
     renderer.render(scene, camera);
 
 
@@ -1530,6 +2087,7 @@ function animate() {
 function createInput(id: string, label: string, value: any, hint: string, type: string, step: number | string, onChange: (val: any) => void) {
     const div = document.createElement('div');
     div.className = 'stat-item';
+    div.title = `${label}: ${hint}`;
 
     // Handle color values (hex num to #hex str)
     let displayValue = value;
@@ -1540,7 +2098,7 @@ function createInput(id: string, label: string, value: any, hint: string, type: 
 
     div.innerHTML = `
         <label class="stat-label" for="${id}">${label}</label>
-        <input class="stat-input" type="${type}" ${type === 'number' ? `step="${step}"` : ''} id="${id}" value="${displayValue}">
+        <input class="stat-input" type="${type}" ${type === 'number' ? `step="${step}"` : ''} id="${id}" value="${displayValue}" aria-label="${label}" title="${label}">
         <span class="stat-hint">${hint}</span>
     `;
 
@@ -1599,7 +2157,9 @@ function returnRenderer(renderer: THREE.WebGLRenderer) {
 let previewRenderer: THREE.WebGLRenderer | null = null;
 let previewScene: THREE.Scene | null = null;
 let previewCamera: THREE.PerspectiveCamera | null = null;
+let previewControls: OrbitControls | null = null;
 let previewBeyblade: { mesh: THREE.Group, tiltGroup: THREE.Group, spinGroup: THREE.Group } | null = null;
+let previewResizeObserver: ResizeObserver | null = null;
 
 function updatePreview(stats: BeybladeStats) {
     if (!previewScene) return;
@@ -1608,14 +2168,35 @@ function updatePreview(stats: BeybladeStats) {
     }
     previewBeyblade = createBeybladeMesh(stats);
     previewScene.add(previewBeyblade.mesh);
+    fitPreviewCameraToBey();
+}
+
+function fitPreviewCameraToBey() {
+    if (!previewCamera || !previewBeyblade) return;
+
+    const box = new THREE.Box3().setFromObject(previewBeyblade.mesh);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxSize = Math.max(size.x, size.y, size.z, 1);
+    const fitDistance = (maxSize / (2 * Math.tan(THREE.MathUtils.degToRad(previewCamera.fov) / 2))) * 1.45;
+
+    previewCamera.position.set(center.x, center.y + maxSize * 0.62, center.z + fitDistance);
+    previewCamera.near = Math.max(0.1, fitDistance / 100);
+    previewCamera.far = fitDistance * 100;
+    previewCamera.lookAt(center);
+    previewCamera.updateProjectionMatrix();
+
+    if (previewControls) {
+        previewControls.target.copy(center);
+        previewControls.update();
+    }
 }
 
 // --- Stat Changer UI ---
 function openStatEditor(targetStats: BeybladeStats, targetName: string) {
     try {
-        let previewControls: OrbitControls | null = null;
         // Create a working copy of stats so we don't apply immediately
-        const tempStats = JSON.parse(JSON.stringify(targetStats));
+        let tempStats = JSON.parse(JSON.stringify(targetStats)) as BeybladeStats;
 
 
         const dialog = document.createElement('dialog');
@@ -1631,74 +2212,169 @@ function openStatEditor(targetStats: BeybladeStats, targetName: string) {
 
         const closeBtn = document.createElement('button');
         closeBtn.className = 'modal-close';
-        closeBtn.innerText = '×';
-        closeBtn.onclick = () => {
-            dialog.close();
-        };
+        closeBtn.setAttribute('aria-label', 'Close');
+        closeBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 6L18 18M18 6L6 18" />
+            </svg>
+        `;
+        closeBtn.onclick = () => dialog.close();
         header.appendChild(closeBtn);
         container.appendChild(header);
 
-        // --- Visual Forge Section (Compact & Wrapped) ---
-        const vSection = document.createElement('div');
-        vSection.className = 'stat-section';
-        vSection.innerHTML = `<div class="section-title">Visual</div>`;
+        const layout = document.createElement('div');
+        layout.className = 'customizer-layout';
+        container.appendChild(layout);
 
-        const vContainer = document.createElement('div');
-        vContainer.className = 'forge-container';
-        vSection.appendChild(vContainer);
+        const previewColumn = document.createElement('div');
+        previewColumn.className = 'preview-column';
+        layout.appendChild(previewColumn);
 
-        // 1. Preview (Floated Left)
         const previewContainer = document.createElement('div');
         previewContainer.className = 'preview-float';
-        vContainer.appendChild(previewContainer);
+        previewColumn.appendChild(previewContainer);
 
-        VISUAL_FIELDS.forEach(field => {
-            try {
-                // Custom compact input creation
-                const div = createInput(
-                    `v-${field.key}`,
-                    field.label,
-                    (targetStats as any)[field.key], // Use targetStats for initial display
-                    field.hint,
-                    field.type,
-                    field.step || 1,
-                    (val) => {
-                        (tempStats as any)[field.key] = val;
-                        updatePreview(tempStats);
-                    }
-                );
-                vContainer.appendChild(div);
-            } catch (e) {
-                console.error('Error creating input for field:', field.key, e);
-            }
+        const customizeBtn = document.createElement('button');
+        customizeBtn.type = 'button';
+        customizeBtn.className = 'preview-customize-btn';
+        customizeBtn.title = 'Customize visual parameters';
+        customizeBtn.setAttribute('aria-label', 'Customize visual parameters');
+        customizeBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h10M18 7h2M4 17h2M10 17h10" />
+                <circle cx="16" cy="7" r="2" />
+                <circle cx="8" cy="17" r="2" />
+            </svg>
+        `;
+        previewContainer.appendChild(customizeBtn);
+
+        const statMeterPanel = document.createElement('div');
+        statMeterPanel.className = 'stat-meter-panel';
+        previewColumn.appendChild(statMeterPanel);
+
+        const randomizeBtn = document.createElement('button');
+        randomizeBtn.className = 'icon-action-btn randomize-btn';
+        randomizeBtn.type = 'button';
+        randomizeBtn.title = 'Random build';
+        randomizeBtn.setAttribute('aria-label', 'Random build');
+        randomizeBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M16 3h5v5M4 20l17-17M21 16v5h-5M15 15l6 6M4 4l5 5" />
+            </svg>
+            <span>Random</span>
+        `;
+
+        const detachedVisualControls = document.createElement('div');
+
+        type TStatMeterConfig = {
+            key: keyof BeybladeStats;
+            label: string;
+            max: number;
+            format: (value: number) => string;
+        };
+
+        const STAT_METER_CONFIGS: TStatMeterConfig[] = [
+            { key: 'atk', label: 'ATK', max: 14, format: (value) => Math.round(value).toString() },
+            { key: 'def', label: 'DEF', max: 11, format: (value) => Math.round(value).toString() },
+            { key: 'sta', label: 'STA', max: 2, format: (value) => value.toFixed(1) },
+            { key: 'spd', label: 'SPD', max: 80, format: (value) => Math.round(value).toString() },
+            { key: 'wt', label: 'WGT', max: 1.6, format: (value) => value.toFixed(2) },
+            { key: 'crtAtk', label: 'CRT', max: 35, format: (value) => Math.round(value).toString() }
+        ];
+
+        STAT_METER_CONFIGS.forEach((field) => {
+            const row = document.createElement('div');
+            row.className = 'stat-meter-row';
+            row.dataset.statKey = field.key;
+            row.innerHTML = `
+                <span class="stat-meter-label">${field.label}</span>
+                <span class="stat-meter-track" role="meter" aria-label="${field.label}" aria-valuemin="0" aria-valuemax="${field.max}" aria-valuenow="0">
+                    <span class="stat-meter-fill"></span>
+                </span>
+                <span class="stat-meter-value">0</span>
+            `;
+            statMeterPanel.appendChild(row);
         });
-        container.appendChild(vSection);
 
+        function refreshStatMeters() {
+            STAT_METER_CONFIGS.forEach((field) => {
+                const row = statMeterPanel.querySelector<HTMLElement>(`[data-stat-key="${field.key}"]`);
+                if (!row) return;
+                const rawValue = Number((tempStats as any)[field.key] ?? 0);
+                const meter = row.querySelector<HTMLElement>('.stat-meter-track');
+                const fill = row.querySelector<HTMLElement>('.stat-meter-fill');
+                const valueEl = row.querySelector<HTMLElement>('.stat-meter-value');
+                const clampedValue = Math.min(rawValue, field.max);
+                if (meter) meter.setAttribute('aria-valuenow', String(clampedValue));
+                if (fill) fill.style.width = `${(clampedValue / field.max) * 100}%`;
+                if (valueEl) valueEl.textContent = field.format(rawValue);
+            });
+        }
+
+        function refreshEditorValues() {
+            [...VISUAL_FIELDS, ...COMBAT_FIELDS].forEach(field => {
+                const visualInput = detachedVisualControls.querySelector<HTMLInputElement>(`#v-${field.key}`);
+                if (visualInput) {
+                    const value = (tempStats as any)[field.key];
+                    visualInput.value = field.type === 'color' ? `#${numberToHex(value ?? 0)}` : String(value);
+                }
+            });
+            refreshStatMeters();
+        }
+
+        refreshStatMeters();
+
+        randomizeBtn.onclick = async () => {
+            randomizeBtn.title = 'Fetching palette';
+            randomizeBtn.disabled = true;
+            const preset = BEY_PRESETS[Math.floor(Math.random() * BEY_PRESETS.length)];
+            const seededStats = {
+                ...JSON.parse(JSON.stringify(targetStats)),
+                ...JSON.parse(JSON.stringify(preset.stats))
+            } as BeybladeStats;
+            tempStats = await buildRandomBeyStats(seededStats);
+            syncTrailWithBolt(tempStats);
+            refreshEditorValues();
+            updatePreview(tempStats);
+            renderMatcapGrid();
+            randomizeBtn.title = 'Random build';
+            randomizeBtn.disabled = false;
+        };
 
         // Setup Preview Scene
         requestAnimationFrame(() => {
-            const width = previewContainer.clientWidth;
-            const height = previewContainer.clientHeight;
+            const width = Math.max(previewContainer.clientWidth, 1);
+            const height = Math.max(previewContainer.clientHeight, 1);
 
-            // Get renderer from pool instead of creating new one
             previewRenderer = getOrCreateRenderer();
             previewRenderer.setSize(width, height);
-            previewRenderer.setClearColor(0x000000, 0); // Transparent background
+            previewRenderer.setClearColor(0x808080, 1);
             previewContainer.appendChild(previewRenderer.domElement);
 
             previewScene = new THREE.Scene();
-            previewCamera = new THREE.PerspectiveCamera(50, width / height, 1, 1000);
-            previewCamera.position.set(0, 40, 60);
+            previewScene.background = new THREE.Color(0x808080);
+            previewCamera = new THREE.PerspectiveCamera(45, width / height, 1, 1000);
+            previewCamera.position.set(0, 44, 72);
             previewCamera.lookAt(0, 5, 0);
 
-            // Orbit Controls for Preview
             previewControls = new OrbitControls(previewCamera, previewRenderer.domElement);
-            previewControls.enableDamping = false; // User requested removal
+            previewControls.enableDamping = false;
 
-            // Lights
-            const ambient = new THREE.AmbientLight(0xffffff, 1.5);
+            const resizePreview = () => {
+                if (!previewRenderer || !previewCamera) return;
+                const nextWidth = Math.max(previewContainer.clientWidth, 1);
+                const nextHeight = Math.max(previewContainer.clientHeight, 1);
+                previewRenderer.setSize(nextWidth, nextHeight);
+                previewCamera.aspect = nextWidth / nextHeight;
+                previewCamera.updateProjectionMatrix();
+                fitPreviewCameraToBey();
+            };
+            previewResizeObserver = new ResizeObserver(resizePreview);
+            previewResizeObserver.observe(previewContainer);
+
+            const ambient = new THREE.AmbientLight(0xffffff, 1.7);
             previewScene.add(ambient);
-            const dir = new THREE.DirectionalLight(0xffffff, 2);
+            const dir = new THREE.DirectionalLight(0xffffff, 2.2);
             dir.position.set(10, 50, 20);
             previewScene.add(dir);
 
@@ -1708,172 +2384,192 @@ function openStatEditor(targetStats: BeybladeStats, targetName: string) {
                 if (!previewRenderer) return;
                 requestAnimationFrame(animatePreview);
 
+                if (previewBeyblade) {
+                    previewBeyblade.mesh.rotation.y += 0.018;
+                    previewBeyblade.spinGroup.rotation.y += 0.04;
+                }
                 if (previewControls) previewControls.update();
-
-                // No rotation as requested
-                // if (previewBeyblade) {
-                //     previewBeyblade.spinGroup.rotation.y += 0.02;
-                // }
-
                 previewRenderer.render(previewScene!, previewCamera!);
             }
             animatePreview();
         });
 
-        // --- Visual Forge (Multi-Part Matcap Selector) ---
         const matcapSection = document.createElement('div');
-        matcapSection.className = 'stat-section';
-        matcapSection.innerHTML = `<div class=\"section-title\">Material</div>`;
+        matcapSection.className = 'stat-section material-section';
+        matcapSection.innerHTML = '<div class="section-title">Parts</div>';
+        detachedVisualControls.appendChild(matcapSection);
 
-        // 1. Part Selector Tabs
-        const parts = [
-            { id: 'wheel', label: 'Wheel' },
-            { id: 'ring', label: 'Ring' },
-            { id: 'bolt', label: 'Bolt' },
-            { id: 'spinTrack', label: 'Track' },
-            { id: 'tip', label: 'Tip' }
+        type TMatcapPart = 'wheel' | 'ring' | 'bolt' | 'spinTrack' | 'tip';
+        const parts: Array<{ id: TMatcapPart, label: string, colorKey: keyof BeybladeStats, shapeKeys: Array<keyof BeybladeStats> }> = [
+            { id: 'wheel', label: 'Base', colorKey: 'wheelColor', shapeKeys: ['beyScale'] },
+            { id: 'ring', label: 'Ring', colorKey: 'ringColor', shapeKeys: ['ringRadiusFactor', 'ringSides'] },
+            { id: 'bolt', label: 'Bolt', colorKey: 'boltColor', shapeKeys: ['boltSides'] },
+            { id: 'spinTrack', label: 'Track', colorKey: 'spinTrackColor', shapeKeys: ['spinTrackSize'] },
+            { id: 'tip', label: 'Tip', colorKey: 'tipColor', shapeKeys: ['tipSize'] }
         ];
-        let activePart = 'wheel'; // Default selection
+        const visualFieldByKey = new Map(VISUAL_FIELDS.map(field => [field.key, field]));
 
-        const tabContainer = document.createElement('div');
-        tabContainer.style.display = 'flex';
-        tabContainer.style.gap = '5px';
-        tabContainer.style.marginBottom = '10px';
+        const materialList = document.createElement('div');
+        materialList.className = 'part-material-list';
+        matcapSection.appendChild(materialList);
 
-        parts.forEach(p => {
-            const tab = document.createElement('button');
-            tab.innerText = p.label;
-            tab.className = 'editor-btn';
-            tab.style.flex = '1';
-            tab.style.padding = '5px';
-            tab.style.fontSize = '12px';
-            if (p.id === activePart) tab.style.background = '#444'; // Highlight active
+        parts.forEach((part) => {
+            const partCard = document.createElement('div');
+            partCard.className = 'part-material-card';
+            partCard.dataset.part = part.id;
+            partCard.innerHTML = `<div class="part-material-title">${part.label}</div>`;
 
-            tab.onclick = () => {
-                console.log('Tab clicked:', p.id);
-                activePart = p.id;
-                // Update tab styles
-                Array.from(tabContainer.children).forEach((c: any) => c.style.background = '#222');
-                tab.style.background = '#444';
-                renderMatcapGrid(); // Refresh grid state
-            };
-            tabContainer.appendChild(tab);
-        });
-        matcapSection.appendChild(tabContainer);
-
-        // 2. Matcap Grid Container
-        const matcapGrid = document.createElement('div');
-        matcapGrid.style.display = 'grid';
-        matcapGrid.style.gridTemplateColumns = 'repeat(5, 1fr)';
-        matcapGrid.style.gap = '8px';
-        matcapGrid.style.maxHeight = '200px';
-        matcapGrid.style.overflowY = 'auto';
-        matcapGrid.style.marginBottom = '15px';
-        matcapSection.appendChild(matcapGrid);
-
-        // Function to render grid based on library
-        function renderMatcapGrid() {
-            console.log('Rendering grid for:', activePart, 'Library size:', MATCAP_LIBRARY.length);
-            matcapGrid.innerHTML = '';
-
-            // Allow "No Matcap" option (Clear)
-            const clearBtn = document.createElement('div');
-            clearBtn.innerText = 'X';
-            clearBtn.className = 'matcap-btn';
-            clearBtn.style.background = '#333';
-            clearBtn.style.color = '#fff';
-            clearBtn.style.display = 'flex';
-            clearBtn.style.alignItems = 'center';
-            clearBtn.style.justifyContent = 'center';
-            clearBtn.onclick = () => {
-                if (!tempStats.partMatcaps) tempStats.partMatcaps = {};
-                delete tempStats.partMatcaps[activePart];
-                updatePreview(tempStats);
-            };
-            matcapGrid.appendChild(clearBtn);
-
-            MATCAP_LIBRARY.forEach(mc => {
-                // UI uses 64px thumb
-                const thumbUrl = mc.thumb;
-                // Application uses 256px full
-                const fullUrl = mc.file;
-
-                const btn = document.createElement('div');
-                btn.className = 'matcap-btn';
-                btn.title = `${mc.category}: ${mc.name}`;
-                btn.style.width = '100%';
-                btn.style.aspectRatio = '1';
-                btn.style.borderRadius = '50%';
-                btn.style.cursor = 'pointer';
-                btn.style.background = `url(${thumbUrl})`;
-                btn.style.backgroundSize = 'cover';
-                btn.style.border = '2px solid transparent';
-                btn.style.boxShadow = '0 2px 5px rgba(0,0,0,0.5)';
-
-                // Highlight if currently selected for this part (compare against fullUrl)
-                const currentVal = tempStats.partMatcaps?.[activePart];
-                if (currentVal === fullUrl) {
-                    btn.style.border = '2px solid #fff';
-                }
-
-                btn.onclick = () => {
-                    const prev = matcapGrid.querySelectorAll('.matcap-btn');
-                    prev.forEach(p => (p as HTMLElement).style.border = '2px solid transparent');
-                    btn.style.border = '2px solid #fff';
-
-                    if (!tempStats.partMatcaps) tempStats.partMatcaps = {};
-                    tempStats.partMatcaps[activePart] = fullUrl; // Save high res
+            const colorControl = createInput(
+                `v-${part.colorKey}`,
+                `${part.label} color`,
+                (targetStats as any)[part.colorKey],
+                'Color',
+                'color',
+                1,
+                (val) => {
+                    (tempStats as any)[part.colorKey] = clampBeyColor(val);
+                    if (part.colorKey === 'boltColor') syncTrailWithBolt(tempStats);
+                    enforceBeyColorContrast(tempStats);
+                    refreshEditorValues();
                     updatePreview(tempStats);
-                };
+                }
+            );
+            colorControl.classList.add('part-color-control');
+            partCard.appendChild(colorControl);
 
-                matcapGrid.appendChild(btn);
+            const shapeGrid = document.createElement('div');
+            shapeGrid.className = 'part-shape-grid';
+            part.shapeKeys.forEach((key) => {
+                const field = visualFieldByKey.get(key as string);
+                if (!field) return;
+
+                const shapeControl = createInput(
+                    `v-${field.key}`,
+                    field.label,
+                    (targetStats as any)[field.key],
+                    field.hint,
+                    field.type,
+                    field.step || 1,
+                    (val) => {
+                        (tempStats as any)[field.key] = val;
+                        updatePreview(tempStats);
+                    }
+                );
+                shapeControl.classList.add('part-shape-control');
+                shapeGrid.appendChild(shapeControl);
+            });
+            partCard.appendChild(shapeGrid);
+
+            const swatchGrid = document.createElement('div');
+            swatchGrid.className = 'matcap-grid';
+            partCard.appendChild(swatchGrid);
+
+            materialList.appendChild(partCard);
+        });
+
+        function renderMatcapGrid() {
+            parts.forEach((part) => {
+                const partCard = materialList.querySelector<HTMLElement>(`[data-part="${part.id}"]`);
+                const grid = partCard?.querySelector<HTMLElement>('.matcap-grid');
+                if (!grid) return;
+                grid.innerHTML = '';
+
+                const clearBtn = document.createElement('button');
+                clearBtn.type = 'button';
+                clearBtn.innerHTML = `
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M6 6L18 18M18 6L6 18" />
+                    </svg>
+                `;
+                clearBtn.className = 'matcap-btn clear';
+                clearBtn.title = `Clear ${part.label} material`;
+                clearBtn.onclick = () => {
+                    if (!tempStats.partMatcaps) tempStats.partMatcaps = {};
+                    delete tempStats.partMatcaps[part.id];
+                    updatePreview(tempStats);
+                    renderMatcapGrid();
+                };
+                grid.appendChild(clearBtn);
+
+                MATCAP_LIBRARY.filter(mc => mc.category !== 'Dark').slice(0, 12).forEach(mc => {
+                    const thumbUrl = mc.thumb;
+                    const fullUrl = mc.file;
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = 'matcap-btn';
+                    btn.title = `${part.label}: ${mc.category}`;
+                    btn.style.background = `url(${thumbUrl}) center / cover`;
+                    btn.classList.toggle('active', tempStats.partMatcaps?.[part.id] === fullUrl);
+                    btn.onclick = () => {
+                        if (!tempStats.partMatcaps) tempStats.partMatcaps = {};
+                        tempStats.partMatcaps[part.id] = fullUrl;
+                        updatePreview(tempStats);
+                        renderMatcapGrid();
+                    };
+                    grid.appendChild(btn);
+                });
             });
         }
 
-        renderMatcapGrid(); // Initial render
-        container.appendChild(matcapSection);
+        renderMatcapGrid();
 
-        // --- Combat Stats Section ---
-        const pSection = document.createElement('div');
-        pSection.className = 'stat-section';
-        pSection.innerHTML = `<div class="section-title">Combat Logic</div>`;
+        let visualDialog: HTMLDialogElement | null = null;
+        function openVisualCustomizationDialog() {
+            if (visualDialog?.open) return;
 
-        const pGrid = document.createElement('div');
-        pGrid.className = 'stat-grid';
+            visualDialog = document.createElement('dialog');
+            visualDialog.className = 'visual-customization-dialog';
 
-        const combatFields = [
-            { key: 'atk', label: 'ATTACK', hint: 'Damage', type: 'number', step: 1 },
-            { key: 'def', label: 'DEFENSE', hint: 'Resistance', type: 'number', step: 1 },
-            { key: 'sta', label: 'STAMINA', hint: 'Endurance', type: 'number', step: 1 },
-            { key: 'spd', label: 'SPEED', hint: 'Velocity', type: 'number', step: 1 },
-            { key: 'wt', label: 'WEIGHT', hint: 'Mass', type: 'number', step: 0.1 },
-            { key: 'crtAtk', label: 'CRIT ATK', hint: 'Crit Dmg', type: 'number', step: 1 },
-        ];
+            const visualContainer = document.createElement('div');
+            visualContainer.className = 'visual-customization-container';
+            visualDialog.appendChild(visualContainer);
 
-        combatFields.forEach(field => {
-            pGrid.appendChild(createInput(
-                `p-${field.key}`,
-                field.label,
-                (targetStats as any)[field.key],
-                field.hint,
-                field.type,
-                field.step,
-                (val) => {
-                    (tempStats as any)[field.key] = val;
-                }
-            ));
-        });
-        pSection.appendChild(pGrid);
-        container.appendChild(pSection);
+            const visualHeader = document.createElement('div');
+            visualHeader.className = 'modal-header';
+            visualHeader.innerHTML = '<span class="modal-title">Visual customization</span>';
 
-        // Actions
+            const visualCloseBtn = document.createElement('button');
+            visualCloseBtn.className = 'modal-close';
+            visualCloseBtn.setAttribute('aria-label', 'Close');
+            visualCloseBtn.innerHTML = `
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M6 6L18 18M18 6L6 18" />
+                </svg>
+            `;
+            visualCloseBtn.onclick = () => visualDialog?.close();
+            visualHeader.appendChild(visualCloseBtn);
+            visualContainer.appendChild(visualHeader);
+
+            const visualBody = document.createElement('div');
+            visualBody.className = 'visual-customization-body';
+            visualBody.appendChild(matcapSection);
+            visualContainer.appendChild(visualBody);
+
+            visualDialog.addEventListener('close', () => {
+                detachedVisualControls.appendChild(matcapSection);
+                visualDialog?.remove();
+                visualDialog = null;
+            });
+
+            document.body.appendChild(visualDialog);
+            visualDialog.showModal();
+        }
+
+        customizeBtn.onclick = openVisualCustomizationDialog;
+
         const actions = document.createElement('div');
         actions.className = 'preset-actions';
 
         const resetBtn = document.createElement('button');
-        resetBtn.className = 'action-btn reset';
-        resetBtn.innerText = 'RESET DEFAULTS';
-        resetBtn.style.flex = '0 0 auto';
+        resetBtn.className = 'icon-action-btn reset';
+        resetBtn.title = 'Reset defaults';
+        resetBtn.setAttribute('aria-label', 'Reset defaults');
+        resetBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 4v6h6M20 20v-6h-6M5.5 15A7 7 0 0 0 17 18.5M18.5 9A7 7 0 0 0 7 5.5" />
+            </svg>
+            <span>Reset</span>
+        `;
 
         resetBtn.onclick = () => {
             if (confirm(`Reset ${targetName} to defaults? This cannot be undone.`)) {
@@ -1891,11 +2587,19 @@ function openStatEditor(targetStats: BeybladeStats, targetName: string) {
         };
 
         const saveBtn = document.createElement('button');
-        saveBtn.className = 'action-btn save';
-        saveBtn.textContent = 'SAVE & APPLY';
+        saveBtn.className = 'icon-action-btn save';
+        saveBtn.title = 'Apply build';
+        saveBtn.setAttribute('aria-label', 'Apply build');
+        saveBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 12l4 4L19 6" />
+            </svg>
+            <span>Apply</span>
+        `;
 
         saveBtn.onclick = () => {
             // Apply temp stats to target
+            syncTrailWithBolt(tempStats);
             Object.assign(targetStats, tempStats);
 
             // Update snapshot so resetMatch uses new stats
@@ -1907,12 +2611,18 @@ function openStatEditor(targetStats: BeybladeStats, targetName: string) {
             resetMatch();
         };
 
+        actions.appendChild(randomizeBtn);
         actions.appendChild(resetBtn);
         actions.appendChild(saveBtn);
         container.appendChild(actions);
 
         // Handle Dialog Close Event for Cleanup
         dialog.addEventListener('close', () => {
+            if (visualDialog?.open) visualDialog.close();
+            if (previewResizeObserver) {
+                previewResizeObserver.disconnect();
+                previewResizeObserver = null;
+            }
             if (previewRenderer) {
                 returnRenderer(previewRenderer);
                 previewRenderer = null;
@@ -1952,6 +2662,45 @@ if (cpuBtn) {
     };
 }
 
+function completeTutorial() {
+    tutorialComplete = true;
+    localStorage.setItem('bblade_tutorial_complete', 'true');
+}
+
+function showTutorialOverlay() {
+    if (tutorialComplete) return;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'tutorial-overlay';
+    overlay.innerHTML = `
+        <div class="tutorial-panel">
+            <span class="kicker">How to win</span>
+            <h1>Hold DIVE, release, crash.</h1>
+            <p>DIVE pulls your bey into the bowl and builds speed. Release into orbit before contact so the hit lands above critical speed.</p>
+            <div class="tutorial-steps">
+                <div><strong>1</strong><span>Aim the launch cone.</span></div>
+                <div><strong>2</strong><span>Hold DIVE to charge speed.</span></div>
+                <div><strong>3</strong><span>Let go before impact for a critical.</span></div>
+            </div>
+            <div class="tutorial-actions">
+                <button class="action-btn reset" id="tutorial-skip">I know this</button>
+                <button class="action-btn save" id="tutorial-start">Start training</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const close = () => {
+        completeTutorial();
+        overlay.remove();
+    };
+
+    overlay.querySelector('#tutorial-start')?.addEventListener('click', close);
+    overlay.querySelector('#tutorial-skip')?.addEventListener('click', close);
+}
+
+showTutorialOverlay();
+
 animate();
 
 
@@ -1963,6 +2712,8 @@ launchBtn.addEventListener('click', () => {
     if (hasLaunched) return;
 
     hasLaunched = true;
+    setCpuPattern(0);
+    scheduleNextCpuDiveSwitch(clock.getElapsedTime() + 0.5);
 
     // Player Launch
     const angleRad = (currentLaunchAngle.value * Math.PI) / 180;
@@ -2016,13 +2767,12 @@ launchBtn.addEventListener('click', () => {
 // Window Resize Handling
 window.addEventListener('resize', () => {
     const aspect = window.innerWidth / window.innerHeight;
-    const frustumSize = 600;
 
     camera.left = frustumSize * aspect / -2;
     camera.right = frustumSize * aspect / 2;
     camera.top = frustumSize / 2;
     camera.bottom = frustumSize / -2;
-    camera.updateProjectionMatrix();
+    syncCriticalFlashPlaneToCamera();
 
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
@@ -2108,6 +2858,9 @@ function resetMatch() {
     // Update action HUD buttons
     resetHint.style.display = 'none';
     cycleBtnContainer.style.display = 'none'; // Hide Pattern Button
+    setPattern(null, 0);
+    setCpuPattern(0);
+    scheduleNextCpuDiveSwitch(clock.getElapsedTime());
 
 
     // Clear Sparks
@@ -2137,6 +2890,7 @@ function resetMatch() {
 
     // Show UI
     launchContainer.style.display = 'flex';
+    currentLaunchAngle.value = DEFAULT_LAUNCH_ANGLE;
     updateGuide(currentLaunchAngle.value);
     guideMesh.visible = true;
 }
