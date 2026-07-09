@@ -1110,6 +1110,7 @@ type TBodyStateSnapshot = {
 type TMultiplayerMessage =
     | { type: 'hello'; stats: BeybladeStats; name: string }
     | { type: 'stats'; stats: BeybladeStats }
+    | { type: 'speed'; speed: TGameSpeedId }
     | { type: 'ready'; launchAngle: number; stats: BeybladeStats }
     | { type: 'dive'; id: string; action: TDiveAction; applyAt: number }
     | { type: 'state'; matchTime: number; player: TBodyStateSnapshot; enemy: TBodyStateSnapshot }
@@ -1728,6 +1729,10 @@ function setCpuPattern(pattern: number) {
     updateCpuPhysicsFromPattern();
 }
 
+function isOnlineMatch() {
+    return multiplayer.role !== 'solo' && localPlayMode !== '2p';
+}
+
 function updateCpuDive(now: number) {
     if (multiplayer.role !== 'solo') return;
     if (localPlayMode === '2p') return;
@@ -1751,9 +1756,9 @@ function applyPlayerDivePattern(pattern: number) {
 // Dive Logic
 const setPattern = (e: Event | null, pattern: number) => {
     if (e) e.preventDefault(); // Prevent ghost clicks
-    if (localDiveIntent === pattern && (multiplayer.role !== 'solo' || currentPatternIndex === pattern)) return;
+    if (localDiveIntent === pattern && (isOnlineMatch() || currentPatternIndex === pattern)) return;
     localDiveIntent = pattern;
-    if (multiplayer.role !== 'solo' && hasLaunched && !gameOver) {
+    if (isOnlineMatch() && hasLaunched && !gameOver) {
         queueLocalDiveEvent(pattern);
         return;
     }
@@ -1781,6 +1786,8 @@ window.addEventListener('keyup', (e) => {
 
 const cycleBtn = document.createElement('button');
 cycleBtn.className = 'pattern-btn';
+cycleBtn.type = 'button';
+cycleBtn.tabIndex = -1;
 currentPatternIndex = 0;
 cycleBtn.innerHTML = `
     <span class="value">P1 Dive</span>
@@ -1788,21 +1795,40 @@ cycleBtn.innerHTML = `
 
 const cpuCycleBtn = document.createElement('button');
 cpuCycleBtn.className = 'pattern-btn cpu-pattern-btn';
+cpuCycleBtn.type = 'button';
+cpuCycleBtn.tabIndex = -1;
 cpuCycleBtn.innerHTML = `
     <span class="value">P2 Dive</span>
 `;
 
-// Event Listeners for Button
-cycleBtn.addEventListener('mousedown', (e) => { setPattern(e, 1) });
-cycleBtn.addEventListener('pointerdown', (e) => { setPattern(e, 1) }, { passive: false });
+function bindGameDiveButton(button: HTMLButtonElement, onPattern: (event: PointerEvent, pattern: number) => void) {
+    const press = (event: PointerEvent) => {
+        if (!event.isPrimary) return;
+        event.preventDefault();
+        button.blur();
+        if (!button.hasPointerCapture(event.pointerId)) {
+            button.setPointerCapture(event.pointerId);
+        }
+        onPattern(event, 1);
+    };
+    const release = (event: PointerEvent) => {
+        if (!event.isPrimary) return;
+        event.preventDefault();
+        if (button.hasPointerCapture(event.pointerId)) {
+            button.releasePointerCapture(event.pointerId);
+        }
+        onPattern(event, 0);
+    };
 
-cycleBtn.addEventListener('pointerup', (e) => { setPattern(e, 0) });
-cycleBtn.addEventListener('pointerleave', (e) => { setPattern(e, 0) });
+    button.addEventListener('pointerdown', press, { passive: false });
+    button.addEventListener('pointerup', release, { passive: false });
+    button.addEventListener('pointercancel', release, { passive: false });
+    button.addEventListener('pointerleave', release, { passive: false });
+    button.addEventListener('contextmenu', (event) => event.preventDefault());
+}
 
-cpuCycleBtn.addEventListener('mousedown', (e) => { e.preventDefault(); setCpuPattern(1); });
-cpuCycleBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); setCpuPattern(1); }, { passive: false });
-cpuCycleBtn.addEventListener('pointerup', (e) => { e.preventDefault(); setCpuPattern(0); });
-cpuCycleBtn.addEventListener('pointerleave', (e) => { e.preventDefault(); setCpuPattern(0); });
+bindGameDiveButton(cycleBtn, (event, pattern) => setPattern(event, pattern));
+bindGameDiveButton(cpuCycleBtn, (_event, pattern) => setCpuPattern(pattern));
 
 cycleBtnContainer.appendChild(cycleBtn);
 cpuCycleBtnContainer.appendChild(cpuCycleBtn);
@@ -1857,6 +1883,31 @@ const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)
 const audioMasterGain = audioCtx.createGain();
 audioMasterGain.gain.value = masterVolume;
 audioMasterGain.connect(audioCtx.destination);
+let audioUnlocked = audioCtx.state === 'running';
+
+async function unlockAudio() {
+    if (audioUnlocked) return;
+    try {
+        if (audioCtx.state === 'suspended') {
+            await audioCtx.resume();
+        }
+        const source = audioCtx.createBufferSource();
+        const gain = audioCtx.createGain();
+        source.buffer = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
+        gain.gain.value = 0.0001;
+        source.connect(gain);
+        gain.connect(audioMasterGain);
+        source.start(0);
+        source.stop(audioCtx.currentTime + 0.01);
+        audioUnlocked = audioCtx.state === 'running';
+    } catch {
+        audioUnlocked = false;
+    }
+}
+
+['pointerdown', 'touchend', 'click'].forEach((eventName) => {
+    window.addEventListener(eventName, unlockAudio, { passive: true });
+});
 
 function setMasterVolume(value: number) {
     masterVolume = THREE.MathUtils.clamp(value, 0, 1);
@@ -1882,9 +1933,23 @@ function setCameraShakeEnabled(value: boolean) {
     }
 }
 
-function setGameSpeed(value: TGameSpeedId) {
+function syncGameSpeedControls() {
+    const lockedByHost = multiplayer.role === 'guest';
+    document.querySelectorAll<HTMLInputElement>('input[name="menu-speed"]').forEach((input) => {
+        const isActive = input.value === currentGameSpeed;
+        input.checked = isActive;
+        input.disabled = lockedByHost;
+        const option = input.closest('.menu-speed-option');
+        option?.classList.toggle('active', isActive);
+        option?.classList.toggle('locked', lockedByHost);
+    });
+}
+
+function setGameSpeed(value: TGameSpeedId, broadcast = true) {
     currentGameSpeed = value;
     localStorage.setItem('bblade_game_speed', value);
+    syncGameSpeedControls();
+    if (broadcast) sendHostGameSpeed();
 }
 
 // Create a noise buffer once
@@ -1907,7 +1972,8 @@ type TBeyNoiseLayer = {
     filter: BiquadFilterNode;
     lowShelf: BiquadFilterNode;
     gain: GainNode;
-    pan: StereoPannerNode;
+    pan: AudioNode;
+    panParam: AudioParam | null;
 };
 
 let playerNoiseLayer: TBeyNoiseLayer | null = null;
@@ -1918,7 +1984,10 @@ function createBeyNoiseLayer(panValue: number): TBeyNoiseLayer {
     const filter = audioCtx.createBiquadFilter();
     const lowShelf = audioCtx.createBiquadFilter();
     const gain = audioCtx.createGain();
-    const pan = audioCtx.createStereoPanner();
+    const pan = typeof audioCtx.createStereoPanner === 'function'
+        ? audioCtx.createStereoPanner()
+        : audioCtx.createGain();
+    const panParam = 'pan' in pan && pan.pan instanceof AudioParam ? pan.pan : null;
 
     source.buffer = windNoiseBuffer;
     source.loop = true;
@@ -1930,7 +1999,7 @@ function createBeyNoiseLayer(panValue: number): TBeyNoiseLayer {
     lowShelf.frequency.value = 180;
     lowShelf.gain.value = 5;
     gain.gain.value = 0;
-    pan.pan.value = panValue;
+    if (panParam) panParam.value = panValue;
 
     source.connect(filter);
     filter.connect(lowShelf);
@@ -1939,7 +2008,7 @@ function createBeyNoiseLayer(panValue: number): TBeyNoiseLayer {
     pan.connect(audioMasterGain);
     source.start();
 
-    return { source, filter, lowShelf, gain, pan };
+    return { source, filter, lowShelf, gain, pan, panParam };
 }
 
 function ensureBeyNoiseLayers() {
@@ -1961,13 +2030,13 @@ function updateBeyNoiseLayer(layer: TBeyNoiseLayer | null, entity: GameEntity, p
     layer.filter.frequency.cancelScheduledValues(now);
     layer.filter.Q.cancelScheduledValues(now);
     layer.source.playbackRate.cancelScheduledValues(now);
-    layer.pan.pan.cancelScheduledValues(now);
+    layer.panParam?.cancelScheduledValues(now);
 
     layer.gain.gain.linearRampToValueAtTime(hasLaunched && !gameOver && !entity.isDead ? targetGain : 0, now + 0.22);
     layer.filter.frequency.linearRampToValueAtTime(targetFrequency, now + 0.22);
     layer.filter.Q.linearRampToValueAtTime(0.78 + speedRatio * 0.42, now + 0.22);
     layer.source.playbackRate.linearRampToValueAtTime(targetPlaybackRate, now + 0.22);
-    layer.pan.pan.linearRampToValueAtTime(panValue, now + 0.22);
+    layer.panParam?.linearRampToValueAtTime(panValue, now + 0.22);
 }
 
 function updateBeyNoiseLayers() {
@@ -2108,9 +2177,7 @@ function updateCriticalFlash() {
 }
 
 function playCollisionSound(intensity: number, baseFrequency: number, isCritical = false) {
-    if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
-    }
+    unlockAudio();
 
     const t = audioCtx.currentTime;
     const masterGain = audioCtx.createGain();
@@ -3219,9 +3286,7 @@ function playMenuSampleHit() {
     if (now - lastMenuSampleAt < 180) return;
     lastMenuSampleAt = now;
 
-    if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
-    }
+    unlockAudio();
     playCollisionSound(0.24, 260, false);
 }
 
@@ -3592,12 +3657,14 @@ function cleanupMultiplayer() {
     setMultiplayerStatus('Offline');
     syncOpponentHudLabel();
     syncLaunchSetupUi();
+    syncGameSpeedControls();
 }
 
 function setLocalPlayMode(mode: TLocalPlayMode) {
     if (multiplayer.role !== 'solo') cleanupMultiplayer();
     localPlayMode = mode;
     syncOpponentHudLabel();
+    syncGameSpeedControls();
     resetMatch();
 }
 
@@ -3637,6 +3704,11 @@ function sendMultiplayerReset() {
     sendMultiplayerMessage({ type: 'reset' });
 }
 
+function sendHostGameSpeed() {
+    if (multiplayer.role !== 'host') return;
+    sendMultiplayerMessage({ type: 'speed', speed: currentGameSpeed });
+}
+
 function sendLocalBeyEdit() {
     if (multiplayer.role === 'solo') return;
     sendLocalBeyStats();
@@ -3666,7 +3738,7 @@ function queueDiveEvent(event: TScheduledDiveEvent) {
 }
 
 function queueLocalDiveEvent(pattern: number) {
-    if (multiplayer.role === 'solo') return;
+    if (!isOnlineMatch()) return;
     if (!multiplayer.conn?.open) return;
     const action = divePatternToAction(pattern);
     const id = `${multiplayer.peerId || multiplayer.role}-${++multiplayer.diveEventSeq}`;
@@ -3686,7 +3758,7 @@ function applyScheduledDiveEvent(event: TScheduledDiveEvent) {
 }
 
 function processScheduledDiveEvents() {
-    if (multiplayer.role === 'solo' || !hasLaunched || gameOver) return;
+    if (!isOnlineMatch() || !hasLaunched || gameOver) return;
     while (multiplayer.diveQueue.length > 0 && multiplayer.diveQueue[0].applyAt <= multiplayer.matchTime + 0.000001) {
         const event = multiplayer.diveQueue.shift();
         if (event) applyScheduledDiveEvent(event);
@@ -3730,13 +3802,13 @@ function blendEntityWithRemoteState(entity: GameEntity, remote: TBodyStateSnapsh
 }
 
 function applyRemoteMatterWorldState(message: Extract<TMultiplayerMessage, { type: 'state' }>) {
-    if (multiplayer.role === 'solo' || !hasLaunched || gameOver) return;
+    if (!isOnlineMatch() || !hasLaunched || gameOver) return;
     blendEntityWithRemoteState(enemy, message.player);
     blendEntityWithRemoteState(player, message.enemy);
 }
 
 function maybeSendMatterWorldStateSample() {
-    if (multiplayer.role === 'solo' || !multiplayer.conn?.open || !hasLaunched || gameOver) return;
+    if (!isOnlineMatch() || !multiplayer.conn?.open || !hasLaunched || gameOver) return;
     if (multiplayer.matchTime + 0.000001 < multiplayer.nextStateSyncAt) return;
     multiplayer.nextStateSyncAt += MULTIPLAYER_STATE_SYNC_INTERVAL_SECONDS;
     if (multiplayer.nextStateSyncAt <= multiplayer.matchTime) {
@@ -3926,6 +3998,14 @@ function handleMultiplayerMessage(data: unknown) {
         return;
     }
 
+    if (message.type === 'speed') {
+        const speed = message.speed;
+        if (multiplayer.role === 'guest' && typeof speed === 'string' && isGameSpeedId(speed)) {
+            setGameSpeed(speed, false);
+        }
+        return;
+    }
+
     if (message.type === 'ready' && multiplayer.role !== 'solo') {
         if (message.stats) applyRemoteStats(message.stats as BeybladeStats);
         if (typeof message.launchAngle === 'number') multiplayer.remoteLaunchAngle = message.launchAngle;
@@ -3975,6 +4055,7 @@ function bindMultiplayerConnection(conn: DataConnection) {
     conn.on('open', () => {
         setMultiplayerStatus('Connected');
         sendMultiplayerMessage({ type: 'hello', stats: cloneStats(PLAYER_STATS), name: 'Player' });
+        sendHostGameSpeed();
         if (multiplayer.localReady) sendMultiplayerReady();
     });
     conn.on('data', handleMultiplayerMessage);
@@ -4095,10 +4176,11 @@ function showMenuDialog() {
 
     const overlay = document.createElement('div');
     overlay.className = 'tutorial-overlay menu-overlay';
+    const speedLockedByHost = multiplayer.role === 'guest';
     const speedOptions = (Object.entries(GAME_SPEEDS) as Array<[TGameSpeedId, typeof GAME_SPEEDS[TGameSpeedId]]>)
         .map(([id, option]) => `
-            <label class="menu-speed-option ${id === currentGameSpeed ? 'active' : ''}">
-                <input type="radio" name="menu-speed" value="${id}" ${id === currentGameSpeed ? 'checked' : ''}>
+            <label class="menu-speed-option ${id === currentGameSpeed ? 'active' : ''} ${speedLockedByHost ? 'locked' : ''}">
+                <input type="radio" name="menu-speed" value="${id}" ${id === currentGameSpeed ? 'checked' : ''} ${speedLockedByHost ? 'disabled' : ''}>
                 <span>${option.label}</span>
             </label>
         `).join('');
@@ -4156,10 +4238,9 @@ function showMenuDialog() {
     });
     overlay.querySelectorAll<HTMLInputElement>('input[name="menu-speed"]').forEach((input) => {
         input.addEventListener('change', () => {
+            if (multiplayer.role === 'guest') return;
             if (!isGameSpeedId(input.value)) return;
             setGameSpeed(input.value);
-            overlay.querySelectorAll('.menu-speed-option').forEach(option => option.classList.remove('active'));
-            input.closest('.menu-speed-option')?.classList.add('active');
         });
     });
     const closeForMode = () => {
@@ -4214,9 +4295,7 @@ launchBtn.addEventListener('click', () => {
         return;
     }
 
-    if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
-    }
+    unlockAudio();
     ensureBeyNoiseLayers();
 
     if (multiplayer.role !== 'solo') {
