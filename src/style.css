@@ -427,6 +427,10 @@ button:disabled {
 }
 
 .pattern-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
   width: 86px;
   height: 86px;
   display: grid;
@@ -438,7 +442,10 @@ button:disabled {
     var(--panel-solid);
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.24), inset 0 0 0 5px var(--ink);
   color: var(--text);
+  cursor: default;
   font-size: 0.82rem;
+  touch-action: none;
+  user-select: none;
 }
 
 .pattern-btn.active {
@@ -447,6 +454,16 @@ button:disabled {
   border-color: var(--text);
   color: var(--ink);
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.24), inset 0 0 0 5px var(--text);
+}
+
+.pattern-btn:focus,
+.pattern-btn:focus-visible {
+  outline: none;
+}
+
+.pattern-btn .value {
+  pointer-events: none;
+  user-select: none;
 }
 
 /* Tutorial */
@@ -843,6 +860,11 @@ button:disabled {
   background: var(--cyan);
   border-color: var(--cyan);
   color: #111;
+}
+
+.menu-speed-option.locked {
+  cursor: default;
+  opacity: 0.62;
 }
 
 .multiplayer-menu {
