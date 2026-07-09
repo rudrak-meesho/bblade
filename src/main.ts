@@ -1,5 +1,6 @@
 
 import Matter from 'matter-js';
+import Peer, { type DataConnection, type PeerOptions } from 'peerjs';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
@@ -106,6 +107,16 @@ const criticalFlashState = {
     worldPoint: undefined as THREE.Vector3 | undefined
 };
 
+const cameraShakeState = {
+    startedAt: -Infinity,
+    duration: 0.24,
+    amplitude: 0,
+    seed: 0,
+    offset: new THREE.Vector3()
+};
+const cameraShakeRight = new THREE.Vector3();
+const cameraShakeUp = new THREE.Vector3();
+
 function syncCriticalFlashPlaneToCamera() {
     camera.updateProjectionMatrix();
     camera.updateMatrixWorld(true);
@@ -126,6 +137,11 @@ document.body.appendChild(launchContainer);
 
 const DEFAULT_LAUNCH_ANGLE = 180;
 const currentLaunchAngle = { value: DEFAULT_LAUNCH_ANGLE };
+let twoPlayerLaunchStep: 'p1' | 'p2' = 'p1';
+let twoPlayerLaunchAngles = { p1: DEFAULT_LAUNCH_ANGLE, p2: 0 };
+let launchCountdownOverlay: HTMLElement | null = null;
+let launchCountdownInterval: number | undefined;
+let launchCountdownComplete: (() => void) | null = null;
 
 // -- Linear Slider --
 // -- Pointer Lock Drag Zone --
@@ -193,6 +209,7 @@ const endAim = (e: PointerEvent) => {
     dragZone.classList.remove('active');
     dragZone.releasePointerCapture(e.pointerId);
     if (document.exitPointerLock) document.exitPointerLock();
+    sendMultiplayerInput({ launchAngle: currentLaunchAngle.value });
     handleTutorialAimComplete();
 };
 
@@ -206,6 +223,38 @@ const launchBtn = document.createElement('button');
 launchBtn.textContent = 'Launch';
 launchBtn.className = 'launch-btn';
 launchContainer.appendChild(launchBtn);
+
+function syncLaunchSetupUi() {
+    if (hasLaunched) return;
+    const aimLabel = dragZone.querySelector<HTMLElement>('.aim-label');
+    launchBtn.disabled = false;
+    if (multiplayer.role !== 'solo') {
+        launchBtn.textContent = multiplayer.localReady ? 'Waiting' : 'Ready';
+        launchBtn.disabled = multiplayer.localReady;
+        if (aimLabel) aimLabel.textContent = 'Aim';
+        return;
+    }
+
+    const isLocalTwoPlayerSetup = localPlayMode === '2p' && multiplayer.role === 'solo';
+    if (isLocalTwoPlayerSetup) {
+        launchBtn.textContent = twoPlayerLaunchStep === 'p1' ? 'P1 Ready' : 'P2 Ready';
+        if (aimLabel) aimLabel.textContent = twoPlayerLaunchStep === 'p1' ? 'P1 Aim' : 'P2 Aim';
+        return;
+    }
+
+    launchBtn.textContent = 'Launch';
+    if (aimLabel) aimLabel.textContent = 'Aim';
+}
+
+function clearLaunchCountdown() {
+    launchCountdownOverlay?.remove();
+    launchCountdownOverlay = null;
+    launchCountdownComplete = null;
+    if (launchCountdownInterval !== undefined) {
+        window.clearInterval(launchCountdownInterval);
+        launchCountdownInterval = undefined;
+    }
+}
 
 
 // move the width segment point to make it a chevron
@@ -286,7 +335,8 @@ scene.add(guideMesh);
 scene.remove(arrowMesh); // Remove the temp plane one
 
 function updateGuide(angleDeg: number) {
-    if (!player) return;
+    const guideEntity = localPlayMode === '2p' && !hasLaunched && twoPlayerLaunchStep === 'p2' ? enemy : player;
+    if (!guideEntity) return;
 
     const angleRad = (angleDeg * Math.PI) / 180;
     const dirX = Math.cos(angleRad);
@@ -301,8 +351,8 @@ function updateGuide(angleDeg: number) {
     const posAttr = guideGeo.attributes.position;
     const uvAttr = guideGeo.attributes.uv;
 
-    const startX = player.mesh.position.x;
-    const startZ = player.mesh.position.z;
+    const startX = guideEntity.mesh.position.x;
+    const startZ = guideEntity.mesh.position.z;
 
     for (let i = 0; i <= guideSegs; i++) {
         const t = i / guideSegs;
@@ -999,6 +1049,8 @@ const PATTERNS: PhysicsPattern[] = [
 
 let currentPatternIndex = 0;
 let cpuPatternIndex = 0;
+let localDiveIntent = 0;
+let cpuDiveIntent = 0;
 
 type TGameSpeedId = 'tutorial' | 'normal' | 'insane';
 
@@ -1023,7 +1075,70 @@ const savedMasterVolume = Number(localStorage.getItem('bblade_master_volume'));
 let currentGameSpeed: TGameSpeedId = normalizeGameSpeedId(savedGameSpeed);
 let masterVolume = Number.isFinite(savedMasterVolume) ? THREE.MathUtils.clamp(savedMasterVolume, 0, 1) : 0.72;
 let flashesEnabled = localStorage.getItem('bblade_flashes_enabled') !== 'false';
+let cameraShakeEnabled = localStorage.getItem('bblade_camera_shake_enabled') !== 'false';
 let cpuNextDiveSwitchAt = 0;
+
+declare global {
+    interface Window {
+        BBLADE_ICE_SERVERS?: RTCIceServer[];
+        BBLADE_RTC_CONFIG?: RTCConfiguration;
+        BBLADE_PEERJS_OPTIONS?: Record<string, unknown>;
+        GLOBAL_ICE_SERVERS?: RTCIceServer[];
+        __ICE_SERVERS__?: RTCIceServer[];
+    }
+}
+
+type TMultiplayerRole = 'solo' | 'host' | 'guest';
+type TMultiplayerStatus = 'Offline' | 'Hosting' | 'Joining' | 'Connected' | 'Disconnected' | 'Error';
+type TLocalPlayMode = '1p' | '2p';
+type TDiveAction = 'dive_on' | 'dive_off';
+type TScheduledDiveEvent = {
+    id: string;
+    side: 'player' | 'enemy';
+    action: TDiveAction;
+    applyAt: number;
+};
+type TBodyStateSnapshot = {
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+    angle: number;
+    angularVelocity: number;
+    rpm: number;
+};
+type TMultiplayerMessage =
+    | { type: 'hello'; stats: BeybladeStats; name: string }
+    | { type: 'stats'; stats: BeybladeStats }
+    | { type: 'ready'; launchAngle: number; stats: BeybladeStats }
+    | { type: 'dive'; id: string; action: TDiveAction; applyAt: number }
+    | { type: 'state'; matchTime: number; player: TBodyStateSnapshot; enemy: TBodyStateSnapshot }
+    | { type: 'input'; launchAngle?: number; launch?: boolean; pattern?: number; stats?: BeybladeStats }
+    | { type: 'reset' };
+
+const MULTIPLAYER_INPUT_DELAY_SECONDS = 0.2;
+const MULTIPLAYER_STATE_SYNC_INTERVAL_SECONDS = 0.1;
+const MULTIPLAYER_STATE_SYNC_CHANCE = 0.5;
+
+const multiplayer = {
+    role: 'solo' as TMultiplayerRole,
+    status: 'Offline' as TMultiplayerStatus,
+    peer: null as Peer | null,
+    conn: null as DataConnection | null,
+    peerId: '',
+    joinLink: '',
+    localReady: false,
+    remoteReady: false,
+    localLaunchAngle: DEFAULT_LAUNCH_ANGLE,
+    remoteLaunchAngle: DEFAULT_LAUNCH_ANGLE,
+    remoteLaunchRequested: false,
+    matchTime: 0,
+    nextStateSyncAt: MULTIPLAYER_STATE_SYNC_INTERVAL_SECONDS,
+    diveEventSeq: 0,
+    diveQueue: [] as TScheduledDiveEvent[],
+    processedDiveEventIds: new Set<string>()
+};
+let localPlayMode: TLocalPlayMode = '1p';
 
 // --- Matcap Resources ---
 const ALLOWED_MATCAP_URLS = [
@@ -1560,7 +1675,7 @@ actionHud.className = 'action-hud';
 const resetHint = document.createElement('button');
 resetHint.className = 'action-hud-btn';
 resetHint.innerText = 'RESET';
-resetHint.onclick = () => resetMatch();
+resetHint.onclick = () => requestMatchReset();
 resetHint.style.display = 'none';
 actionHud.appendChild(resetHint);
 
@@ -1574,6 +1689,11 @@ const cycleBtnContainer = document.createElement('div');
 cycleBtnContainer.className = 'cycle-container';
 cycleBtnContainer.style.display = 'none'; // Hidden initially
 uiContainer.appendChild(cycleBtnContainer);
+
+const cpuCycleBtnContainer = document.createElement('div');
+cpuCycleBtnContainer.className = 'cycle-container cpu-cycle-container';
+cpuCycleBtnContainer.style.display = 'none';
+uiContainer.appendChild(cpuCycleBtnContainer);
 
 function updatePhysicsFromPattern() {
     if (!player || !player.body || !player.stats) return;
@@ -1601,11 +1721,16 @@ function scheduleNextCpuDiveSwitch(now: number) {
 }
 
 function setCpuPattern(pattern: number) {
+    cpuDiveIntent = pattern;
     cpuPatternIndex = pattern;
+    if (pattern === 1) cpuCycleBtn.classList.add('active');
+    else cpuCycleBtn.classList.remove('active');
     updateCpuPhysicsFromPattern();
 }
 
 function updateCpuDive(now: number) {
+    if (multiplayer.role !== 'solo') return;
+    if (localPlayMode === '2p') return;
     if (!hasLaunched || gameOver) return;
     if (now < cpuNextDiveSwitchAt) return;
 
@@ -1615,26 +1740,42 @@ function updateCpuDive(now: number) {
     scheduleNextCpuDiveSwitch(now);
 }
 
-// Dive Logic
-const setPattern = (e: Event | null, pattern: number) => {
-    if (e) e.preventDefault(); // Prevent ghost clicks
+function applyPlayerDivePattern(pattern: number) {
     currentPatternIndex = pattern;
     if (pattern === 1) cycleBtn.classList.add('active');
     else cycleBtn.classList.remove('active');
     updatePhysicsFromPattern();
     if (pattern === 1) handleTutorialDivePressed();
+}
+
+// Dive Logic
+const setPattern = (e: Event | null, pattern: number) => {
+    if (e) e.preventDefault(); // Prevent ghost clicks
+    if (localDiveIntent === pattern && (multiplayer.role !== 'solo' || currentPatternIndex === pattern)) return;
+    localDiveIntent = pattern;
+    if (multiplayer.role !== 'solo' && hasLaunched && !gameOver) {
+        queueLocalDiveEvent(pattern);
+        return;
+    }
+    applyPlayerDivePattern(pattern);
 };
 
-// Input for Dive Mode (Space)
+// Input for Dive Mode
 window.addEventListener('keydown', (e) => {
-    if (e.code === 'Space' && currentPatternIndex !== 1) {
+    if (e.code === 'KeyA') {
         setPattern(null, 1);
+    }
+    if (e.code === 'KeyL' && localPlayMode === '2p' && cpuDiveIntent !== 1) {
+        setCpuPattern(1);
     }
 });
 
 window.addEventListener('keyup', (e) => {
-    if (e.code === 'Space') {
+    if (e.code === 'KeyA') {
         setPattern(null, 0);
+    }
+    if (e.code === 'KeyL' && localPlayMode === '2p') {
+        setCpuPattern(0);
     }
 });
 
@@ -1642,7 +1783,13 @@ const cycleBtn = document.createElement('button');
 cycleBtn.className = 'pattern-btn';
 currentPatternIndex = 0;
 cycleBtn.innerHTML = `
-    <span class="value">Dive</span>
+    <span class="value">P1 Dive</span>
+`;
+
+const cpuCycleBtn = document.createElement('button');
+cpuCycleBtn.className = 'pattern-btn cpu-pattern-btn';
+cpuCycleBtn.innerHTML = `
+    <span class="value">P2 Dive</span>
 `;
 
 // Event Listeners for Button
@@ -1652,8 +1799,13 @@ cycleBtn.addEventListener('pointerdown', (e) => { setPattern(e, 1) }, { passive:
 cycleBtn.addEventListener('pointerup', (e) => { setPattern(e, 0) });
 cycleBtn.addEventListener('pointerleave', (e) => { setPattern(e, 0) });
 
+cpuCycleBtn.addEventListener('mousedown', (e) => { e.preventDefault(); setCpuPattern(1); });
+cpuCycleBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); setCpuPattern(1); }, { passive: false });
+cpuCycleBtn.addEventListener('pointerup', (e) => { e.preventDefault(); setCpuPattern(0); });
+cpuCycleBtn.addEventListener('pointerleave', (e) => { e.preventDefault(); setCpuPattern(0); });
 
 cycleBtnContainer.appendChild(cycleBtn);
+cpuCycleBtnContainer.appendChild(cpuCycleBtn);
 
 // Init Physics
 updatePhysicsFromPattern();
@@ -1718,6 +1870,15 @@ function setFlashesEnabled(value: boolean) {
     if (!flashesEnabled) {
         criticalFlashUniforms.uIntensity.value = 0;
         criticalFlashPlane.visible = false;
+    }
+}
+
+function setCameraShakeEnabled(value: boolean) {
+    cameraShakeEnabled = value;
+    localStorage.setItem('bblade_camera_shake_enabled', String(value));
+    if (!cameraShakeEnabled) {
+        clearCameraShakeOffset();
+        cameraShakeState.startedAt = -Infinity;
     }
 }
 
@@ -1864,7 +2025,62 @@ function updateCriticalFlashOrigin() {
     }
 }
 
+function clearCameraShakeOffset() {
+    if (cameraShakeState.offset.lengthSq() === 0) return;
+    camera.position.sub(cameraShakeState.offset);
+    cameraShakeState.offset.set(0, 0, 0);
+    camera.updateMatrixWorld(true);
+}
+
+function triggerCameraShake(worldPoint?: THREE.Vector3) {
+    if (!cameraShakeEnabled) return;
+
+    let screenBias = 1;
+    if (worldPoint) {
+        const projected = worldPoint.clone().project(camera);
+        if (Number.isFinite(projected.x) && Number.isFinite(projected.y)) {
+            screenBias = THREE.MathUtils.clamp(1.16 - Math.hypot(projected.x, projected.y) * 0.12, 0.9, 1.16);
+        }
+    }
+
+    cameraShakeState.startedAt = clock.getElapsedTime();
+    cameraShakeState.duration = 0.22;
+    cameraShakeState.amplitude = 9.5 * screenBias;
+    cameraShakeState.seed = Math.random() * Math.PI * 2;
+}
+
+function updateCameraShake() {
+    clearCameraShakeOffset();
+    if (!cameraShakeEnabled) return;
+
+    const elapsed = clock.getElapsedTime() - cameraShakeState.startedAt;
+    if (elapsed < 0 || elapsed > cameraShakeState.duration) return;
+
+    const progress = THREE.MathUtils.clamp(elapsed / cameraShakeState.duration, 0, 1);
+    const fade = Math.pow(1 - progress, 2.35);
+    const hitSnap = elapsed < 0.035 ? 1.18 : 1;
+    const phase = cameraShakeState.seed;
+    const x = (
+        Math.sin(elapsed * 86 + phase) * 0.68 +
+        Math.sin(elapsed * 157 + phase * 1.7) * 0.32
+    ) * cameraShakeState.amplitude * fade * hitSnap;
+    const y = (
+        Math.cos(elapsed * 94 + phase * 0.6) * 0.62 +
+        Math.sin(elapsed * 173 + phase * 2.1) * 0.38
+    ) * cameraShakeState.amplitude * fade * hitSnap;
+
+    cameraShakeRight.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+    cameraShakeUp.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+    cameraShakeState.offset
+        .copy(cameraShakeRight)
+        .multiplyScalar(x)
+        .addScaledVector(cameraShakeUp, y);
+    camera.position.add(cameraShakeState.offset);
+    camera.updateMatrixWorld(true);
+}
+
 function triggerCriticalFeedback(worldPoint?: THREE.Vector3) {
+    triggerCameraShake(worldPoint);
     if (!flashesEnabled) return;
 
     criticalFlashState.worldPoint = worldPoint?.clone();
@@ -2086,6 +2302,7 @@ function animate() {
     const subStepDelta = simulationPaused ? 0 : ((1000 / 60) * speedMultiplier) / SUBSTEPS;
     if (!simulationPaused) updateCpuDive(clock.getElapsedTime());
     for (let i = 0; i < SUBSTEPS && !simulationPaused; i++) {
+        processScheduledDiveEvents();
         Engine.update(engine, subStepDelta);
 
         if (hasLaunched) {
@@ -2142,7 +2359,11 @@ function animate() {
                 }
             });
         }
+        if (hasLaunched && multiplayer.role !== 'solo') {
+            multiplayer.matchTime += subStepDelta / 1000;
+        }
     }
+    if (!simulationPaused) maybeSendMatterWorldStateSample();
 
     // Update Visuals
     entities.forEach(entity => {
@@ -2211,7 +2432,7 @@ function animate() {
                 if (!gameOver) {
                     gameOver = true;
                     if (entity === player) {
-                        showWinner('CPU WINS', enemy.stats?.trailColor || ENEMY_STATS.trailColor);
+                        showWinner(`${getOpponentLabel()} WINS`, enemy.stats?.trailColor || ENEMY_STATS.trailColor);
                     } else if (entity === enemy) {
                         showWinner('P1 WINS', player.stats?.trailColor || PLAYER_STATS.trailColor);
                     }
@@ -2359,24 +2580,26 @@ function animate() {
             enemyMeterEl.value = enemyRpm;
         }
         playerMeterEl.title = `P1 RPM ${playerRpm}`;
-        enemyMeterEl.title = `CPU RPM ${enemyRpm}`;
+        enemyMeterEl.title = `${getOpponentLabel()} RPM ${enemyRpm}`;
 
     }
 
     // Update controls
+    clearCameraShakeOffset();
     controls.update();
+    updateCameraShake();
     syncCriticalFlashPlaneToCamera();
     updateBeyNoiseLayers();
     updateTutorialFlow(clock.getElapsedTime());
 
-    if (!hasLaunched) {
+    if (!hasLaunched && !launchCountdownOverlay) {
         const angle = currentLaunchAngle.value;
         updateGuide(angle);
         guideMesh.visible = true;
         arrowMat.uniforms.uTime.value = clock.getElapsedTime();
     } else {
         guideMesh.visible = false;
-        launchContainer.style.display = 'none';
+        if (hasLaunched) launchContainer.style.display = 'none';
     }
 
     updateCriticalFlash();
@@ -2883,8 +3106,10 @@ function openStatEditor(targetStats: BeybladeStats, targetName: string) {
                 if (targetName === 'CPU') matchStartEnemyStats = JSON.parse(JSON.stringify(DEFAULT_ENEMY_STATS));
 
                 savePresets();
+                if (targetName === 'Player') sendLocalBeyEdit();
                 dialog.close();
                 resetMatch();
+                syncHudButtonColors();
             }
         };
 
@@ -2909,8 +3134,10 @@ function openStatEditor(targetStats: BeybladeStats, targetName: string) {
             if (targetName === 'CPU') matchStartEnemyStats = JSON.parse(JSON.stringify(targetStats));
 
             savePresets();
+            if (targetName === 'Player') sendLocalBeyEdit();
             dialog.close();
             resetMatch();
+            syncHudButtonColors();
         };
 
         actions.appendChild(randomizeBtn);
@@ -2960,9 +3187,30 @@ if (p1Btn) {
 
 if (cpuBtn) {
     cpuBtn.onclick = () => {
+        if (multiplayer.role !== 'solo') return;
         openStatEditor(ENEMY_STATS, 'CPU');
     };
 }
+
+function syncOpponentHudLabel() {
+    const label = getOpponentLabel();
+    if (cpuBtn) {
+        const isPeerOpponent = multiplayer.role !== 'solo';
+        cpuBtn.textContent = label;
+        cpuBtn.title = isPeerOpponent ? `${label} config is controlled by the peer` : `Customize ${label}`;
+        cpuBtn.toggleAttribute('disabled', isPeerOpponent);
+        cpuBtn.setAttribute('aria-disabled', String(isPeerOpponent));
+    }
+    enemyMeterEl.setAttribute('aria-label', `${label} RPM`);
+    syncHudButtonColors();
+}
+
+function syncHudButtonColors() {
+    if (p1Btn) p1Btn.style.setProperty('--bey-trail-color', `#${numberToHex(PLAYER_STATS.trailColor)}`);
+    if (cpuBtn) cpuBtn.style.setProperty('--bey-trail-color', `#${numberToHex(ENEMY_STATS.trailColor)}`);
+}
+
+syncOpponentHudLabel();
 
 let lastMenuSampleAt = 0;
 
@@ -3300,6 +3548,548 @@ function updateTutorialFlow(now: number) {
     }
 }
 
+function cloneStats(stats: BeybladeStats): BeybladeStats {
+    return JSON.parse(JSON.stringify(stats)) as BeybladeStats;
+}
+
+function setMultiplayerStatus(status: TMultiplayerStatus) {
+    multiplayer.status = status;
+    document.querySelectorAll<HTMLElement>('.multiplayer-status').forEach((el) => {
+        el.textContent = getMultiplayerStatusText();
+    });
+    document.querySelectorAll<HTMLInputElement>('.multiplayer-link').forEach((input) => {
+        input.value = multiplayer.joinLink;
+    });
+    syncLaunchSetupUi();
+}
+
+function getGlobalRtcConfig(): RTCConfiguration | undefined {
+    if (window.BBLADE_RTC_CONFIG) return window.BBLADE_RTC_CONFIG;
+    const iceServers = window.BBLADE_ICE_SERVERS || window.GLOBAL_ICE_SERVERS || window.__ICE_SERVERS__;
+    return iceServers?.length ? { iceServers } : undefined;
+}
+
+function getPeerOptions(): PeerOptions {
+    const rtcConfig = getGlobalRtcConfig();
+    const baseOptions = { ...(window.BBLADE_PEERJS_OPTIONS || {}) } as PeerOptions;
+    return rtcConfig ? { ...baseOptions, config: rtcConfig } : baseOptions;
+}
+
+function cleanupMultiplayer() {
+    multiplayer.conn?.close();
+    multiplayer.peer?.destroy();
+    multiplayer.role = 'solo';
+    multiplayer.status = 'Offline';
+    multiplayer.peer = null;
+    multiplayer.conn = null;
+    multiplayer.peerId = '';
+    multiplayer.joinLink = '';
+    multiplayer.localReady = false;
+    multiplayer.remoteReady = false;
+    multiplayer.localLaunchAngle = DEFAULT_LAUNCH_ANGLE;
+    multiplayer.remoteLaunchAngle = DEFAULT_LAUNCH_ANGLE;
+    multiplayer.remoteLaunchRequested = false;
+    setMultiplayerStatus('Offline');
+    syncOpponentHudLabel();
+    syncLaunchSetupUi();
+}
+
+function setLocalPlayMode(mode: TLocalPlayMode) {
+    if (multiplayer.role !== 'solo') cleanupMultiplayer();
+    localPlayMode = mode;
+    syncOpponentHudLabel();
+    resetMatch();
+}
+
+function getMultiplayerStatusText() {
+    if (multiplayer.role === 'solo') return 'Ready';
+    if (multiplayer.status === 'Connected') return `${multiplayer.role === 'host' ? 'Hosting' : 'Joined'} - connected`;
+    return `${multiplayer.role === 'host' ? 'Host' : 'Join'} - ${multiplayer.status}`;
+}
+
+function getOpponentLabel() {
+    return localPlayMode === '2p' || multiplayer.role !== 'solo' ? 'P2' : 'CPU';
+}
+
+function createJoinLink(peerId: string) {
+    const url = new URL(window.location.href);
+    url.searchParams.set('joinPeer', peerId);
+    return url.toString();
+}
+
+function sendMultiplayerMessage(message: TMultiplayerMessage) {
+    if (!multiplayer.conn?.open) return;
+    multiplayer.conn.send(message);
+}
+
+function sendMultiplayerInput(input: Omit<Extract<TMultiplayerMessage, { type: 'input' }>, 'type'>) {
+    if (multiplayer.role === 'solo') return;
+    sendMultiplayerMessage({ type: 'input', ...input });
+}
+
+function sendLocalBeyStats() {
+    if (multiplayer.role === 'solo') return;
+    sendMultiplayerMessage({ type: 'stats', stats: cloneStats(PLAYER_STATS) });
+}
+
+function sendMultiplayerReset() {
+    if (multiplayer.role === 'solo') return;
+    sendMultiplayerMessage({ type: 'reset' });
+}
+
+function sendLocalBeyEdit() {
+    if (multiplayer.role === 'solo') return;
+    sendLocalBeyStats();
+    sendMultiplayerReset();
+}
+
+function diveActionToPattern(action: TDiveAction) {
+    return action === 'dive_on' ? 1 : 0;
+}
+
+function divePatternToAction(pattern: number): TDiveAction {
+    return pattern === 1 ? 'dive_on' : 'dive_off';
+}
+
+function resetMultiplayerDiveQueue() {
+    multiplayer.matchTime = 0;
+    multiplayer.nextStateSyncAt = MULTIPLAYER_STATE_SYNC_INTERVAL_SECONDS;
+    multiplayer.diveQueue = [];
+    multiplayer.processedDiveEventIds.clear();
+}
+
+function queueDiveEvent(event: TScheduledDiveEvent) {
+    if (multiplayer.processedDiveEventIds.has(event.id)) return;
+    if (multiplayer.diveQueue.some((queued) => queued.id === event.id)) return;
+    multiplayer.diveQueue.push(event);
+    multiplayer.diveQueue.sort((a, b) => a.applyAt - b.applyAt);
+}
+
+function queueLocalDiveEvent(pattern: number) {
+    if (multiplayer.role === 'solo') return;
+    if (!multiplayer.conn?.open) return;
+    const action = divePatternToAction(pattern);
+    const id = `${multiplayer.peerId || multiplayer.role}-${++multiplayer.diveEventSeq}`;
+    const applyAt = multiplayer.matchTime + MULTIPLAYER_INPUT_DELAY_SECONDS;
+    queueDiveEvent({ id, side: 'player', action, applyAt });
+    sendMultiplayerMessage({ type: 'dive', id, action, applyAt });
+}
+
+function applyScheduledDiveEvent(event: TScheduledDiveEvent) {
+    const pattern = diveActionToPattern(event.action);
+    if (event.side === 'player') {
+        applyPlayerDivePattern(pattern);
+    } else {
+        setCpuPattern(pattern);
+    }
+    multiplayer.processedDiveEventIds.add(event.id);
+}
+
+function processScheduledDiveEvents() {
+    if (multiplayer.role === 'solo' || !hasLaunched || gameOver) return;
+    while (multiplayer.diveQueue.length > 0 && multiplayer.diveQueue[0].applyAt <= multiplayer.matchTime + 0.000001) {
+        const event = multiplayer.diveQueue.shift();
+        if (event) applyScheduledDiveEvent(event);
+    }
+}
+
+function getBodyStateSnapshot(entity: GameEntity): TBodyStateSnapshot {
+    return {
+        x: entity.body.position.x,
+        y: entity.body.position.y,
+        vx: entity.body.velocity.x,
+        vy: entity.body.velocity.y,
+        angle: entity.body.angle,
+        angularVelocity: entity.body.angularVelocity,
+        rpm: entity.currentRpm || 0
+    };
+}
+
+function averageAngle(localAngle: number, remoteAngle: number) {
+    let delta = remoteAngle - localAngle;
+    while (delta > Math.PI) delta -= Math.PI * 2;
+    while (delta < -Math.PI) delta += Math.PI * 2;
+    return localAngle + delta * 0.5;
+}
+
+function blendEntityWithRemoteState(entity: GameEntity, remote: TBodyStateSnapshot) {
+    if (entity.isDead) return;
+    Body.setPosition(entity.body, {
+        x: (entity.body.position.x + remote.x) * 0.5,
+        y: (entity.body.position.y + remote.y) * 0.5
+    });
+    Body.setVelocity(entity.body, {
+        x: (entity.body.velocity.x + remote.vx) * 0.5,
+        y: (entity.body.velocity.y + remote.vy) * 0.5
+    });
+    Body.setAngle(entity.body, averageAngle(entity.body.angle, remote.angle));
+    Body.setAngularVelocity(entity.body, (entity.body.angularVelocity + remote.angularVelocity) * 0.5);
+    if (entity.currentRpm !== undefined && Number.isFinite(remote.rpm)) {
+        entity.currentRpm = (entity.currentRpm + remote.rpm) * 0.5;
+    }
+}
+
+function applyRemoteMatterWorldState(message: Extract<TMultiplayerMessage, { type: 'state' }>) {
+    if (multiplayer.role === 'solo' || !hasLaunched || gameOver) return;
+    blendEntityWithRemoteState(enemy, message.player);
+    blendEntityWithRemoteState(player, message.enemy);
+}
+
+function maybeSendMatterWorldStateSample() {
+    if (multiplayer.role === 'solo' || !multiplayer.conn?.open || !hasLaunched || gameOver) return;
+    if (multiplayer.matchTime + 0.000001 < multiplayer.nextStateSyncAt) return;
+    multiplayer.nextStateSyncAt += MULTIPLAYER_STATE_SYNC_INTERVAL_SECONDS;
+    if (multiplayer.nextStateSyncAt <= multiplayer.matchTime) {
+        multiplayer.nextStateSyncAt = multiplayer.matchTime + MULTIPLAYER_STATE_SYNC_INTERVAL_SECONDS;
+    }
+    if (Math.random() > MULTIPLAYER_STATE_SYNC_CHANCE) return;
+    sendMultiplayerMessage({
+        type: 'state',
+        matchTime: multiplayer.matchTime,
+        player: getBodyStateSnapshot(player),
+        enemy: getBodyStateSnapshot(enemy)
+    });
+}
+
+function sendMultiplayerReady() {
+    if (multiplayer.role === 'solo') return;
+    sendMultiplayerMessage({
+        type: 'ready',
+        launchAngle: multiplayer.localLaunchAngle,
+        stats: cloneStats(PLAYER_STATS)
+    });
+}
+
+function tryStartMultiplayerCountdown() {
+    if (multiplayer.role === 'solo' || hasLaunched || launchCountdownOverlay) return;
+    if (!multiplayer.localReady || !multiplayer.remoteReady) return;
+    startLaunchCountdown(() => startLocalSimulatedMatch(multiplayer.localLaunchAngle));
+}
+
+function markLocalMultiplayerReady() {
+    if (multiplayer.role === 'solo' || multiplayer.localReady || hasLaunched) return;
+    multiplayer.localReady = true;
+    multiplayer.localLaunchAngle = currentLaunchAngle.value;
+    syncLaunchSetupUi();
+    sendMultiplayerReady();
+    tryStartMultiplayerCountdown();
+}
+
+function launchEntity(entity: GameEntity, angleDeg: number) {
+    const angleRad = (angleDeg * Math.PI) / 180;
+    const launchSpeed = entity.stats ? entity.stats.spd : 200;
+    Body.setVelocity(entity.body, {
+        x: Math.cos(angleRad) * launchSpeed * 0.1,
+        y: Math.sin(angleRad) * launchSpeed * 0.1
+    });
+
+    if (entity.stats) {
+        entity.currentRpm = entity.stats.maxRpm;
+        Body.setAngularVelocity(entity.body, entity.currentRpm / 100);
+    } else {
+        Body.setAngularVelocity(entity.body, 50);
+    }
+}
+
+function primeEntityForMatch(entity: GameEntity) {
+    if (entity.stats) {
+        entity.currentRpm = entity.stats.maxRpm;
+        Body.setAngularVelocity(entity.body, entity.currentRpm / 100);
+    }
+}
+
+function finishLocalLaunch() {
+    matchStartPlayerStats = JSON.parse(JSON.stringify(player.stats));
+    matchStartEnemyStats = JSON.parse(JSON.stringify(enemy.stats));
+    launchContainer.style.display = 'none';
+    cycleBtnContainer.style.display = 'flex';
+    cpuCycleBtnContainer.style.display = localPlayMode === '2p' ? 'flex' : 'none';
+    resetHint.style.display = 'block';
+}
+
+function startLocalSimulatedMatch(localLaunchAngle: number, localOpponentAngle?: number) {
+    resetMatchCounters();
+    resetMultiplayerDiveQueue();
+    hasLaunched = true;
+    if (tutorialModeActive && tutorialPhase === 'launch') {
+        clearTutorialInstruction();
+        tutorialPhase = 'waitingDiveMoment';
+        tutorialNextPromptAt = clock.getElapsedTime() + 2.4;
+    }
+
+    setCpuPattern(0);
+    scheduleNextCpuDiveSwitch(clock.getElapsedTime() + 0.5);
+    launchEntity(player, localLaunchAngle);
+    if (multiplayer.role !== 'solo') {
+        if (multiplayer.remoteReady || multiplayer.remoteLaunchRequested) launchEntity(enemy, multiplayer.remoteLaunchAngle);
+        else primeEntityForMatch(enemy);
+    } else {
+        const opponentAngle = typeof localOpponentAngle === 'number'
+            ? localOpponentAngle
+            : localPlayMode === '2p'
+                ? (localLaunchAngle + 180) % 360
+                : Math.random() * 360;
+        launchEntity(enemy, opponentAngle);
+    }
+    finishLocalLaunch();
+}
+
+function startLaunchCountdown(onComplete: () => void) {
+    if (launchCountdownOverlay) return;
+    clearLaunchCountdown();
+    launchCountdownComplete = onComplete;
+    launchContainer.style.display = 'none';
+    guideMesh.visible = false;
+
+    let count = 3;
+    const overlay = document.createElement('div');
+    overlay.className = 'launch-countdown-overlay';
+    overlay.innerHTML = `<div class="launch-countdown-text">${count}</div>`;
+    document.body.appendChild(overlay);
+    launchCountdownOverlay = overlay;
+
+    launchCountdownInterval = window.setInterval(() => {
+        count -= 1;
+        const text = overlay.querySelector<HTMLElement>('.launch-countdown-text');
+        if (count > 0) {
+            if (text) text.textContent = String(count);
+            return;
+        }
+
+        if (text) text.textContent = 'GO';
+        if (launchCountdownInterval !== undefined) {
+            window.clearInterval(launchCountdownInterval);
+            launchCountdownInterval = undefined;
+        }
+        window.setTimeout(() => {
+            const complete = launchCountdownComplete;
+            clearLaunchCountdown();
+            complete?.();
+        }, 300);
+    }, 1000);
+}
+
+function startTwoPlayerLaunchCountdown() {
+    startLaunchCountdown(() => startLocalSimulatedMatch(twoPlayerLaunchAngles.p1, twoPlayerLaunchAngles.p2));
+}
+
+function applyStatsToEntityPreservingMatchState(entity: GameEntity, stats: BeybladeStats) {
+    const currentPosition = { x: entity.body.position.x, y: entity.body.position.y };
+    const currentVelocity = { x: entity.body.velocity.x, y: entity.body.velocity.y };
+    const currentAngularVelocity = entity.body.angularVelocity;
+    const currentAngle = entity.body.angle;
+    const currentRpm = entity.currentRpm;
+
+    scene.remove(entity.mesh);
+    const newVisuals = createBeybladeMesh(stats);
+    entity.mesh = newVisuals.mesh;
+    entity.tiltGroup = newVisuals.tiltGroup;
+    entity.spinGroup = newVisuals.spinGroup;
+    scene.add(entity.mesh);
+
+    Body.setDensity(entity.body, stats.densityBase * stats.wt);
+    entity.body.restitution = stats.restitution;
+    entity.body.friction = stats.friction;
+    entity.body.frictionAir = stats.frictionAir;
+    Body.setPosition(entity.body, currentPosition);
+    Body.setVelocity(entity.body, currentVelocity);
+    Body.setAngularVelocity(entity.body, currentAngularVelocity);
+    Body.setAngle(entity.body, currentAngle);
+
+    entity.stats = stats;
+    entity.currentRpm = currentRpm;
+    if (entity.trail) {
+        entity.trail.setColor(stats.trailColor);
+    }
+    setBeyVortexColor(entity.mesh, stats.trailColor);
+}
+
+function applyRemoteStats(stats: BeybladeStats) {
+    Object.assign(ENEMY_STATS, { ...DEFAULT_ENEMY_STATS, ...stats });
+    sanitizePartMatcaps(ENEMY_STATS);
+    enforceBeyColorContrast(ENEMY_STATS);
+    matchStartEnemyStats = JSON.parse(JSON.stringify(ENEMY_STATS));
+    syncHudButtonColors();
+    if (!hasLaunched) {
+        resetEntityVisualsAndPhysics(enemy, ENEMY_STATS, { x: 0, y: -100 });
+    } else {
+        applyStatsToEntityPreservingMatchState(enemy, ENEMY_STATS);
+    }
+}
+
+function handleMultiplayerMessage(data: unknown) {
+    const message = data as Partial<TMultiplayerMessage>;
+    if (!message || typeof message.type !== 'string') return;
+
+    if ((message.type === 'hello' || message.type === 'stats') && 'stats' in message && message.stats) {
+        applyRemoteStats(message.stats as BeybladeStats);
+        return;
+    }
+
+    if (message.type === 'ready' && multiplayer.role !== 'solo') {
+        if (message.stats) applyRemoteStats(message.stats as BeybladeStats);
+        if (typeof message.launchAngle === 'number') multiplayer.remoteLaunchAngle = message.launchAngle;
+        multiplayer.remoteReady = true;
+        multiplayer.remoteLaunchRequested = true;
+        tryStartMultiplayerCountdown();
+        return;
+    }
+
+    if (message.type === 'dive' && multiplayer.role !== 'solo') {
+        if (typeof message.id !== 'string' || typeof message.applyAt !== 'number') return;
+        if (message.action !== 'dive_on' && message.action !== 'dive_off') return;
+        queueDiveEvent({
+            id: message.id,
+            side: 'enemy',
+            action: message.action,
+            applyAt: message.applyAt
+        });
+        return;
+    }
+
+    if (message.type === 'state' && multiplayer.role !== 'solo') {
+        if (!message.player || !message.enemy) return;
+        applyRemoteMatterWorldState(message as Extract<TMultiplayerMessage, { type: 'state' }>);
+        return;
+    }
+
+    if (message.type === 'input' && multiplayer.role !== 'solo') {
+        if (typeof message.launchAngle === 'number') multiplayer.remoteLaunchAngle = message.launchAngle;
+        if (typeof message.pattern === 'number') setCpuPattern(message.pattern);
+        if (message.stats) applyRemoteStats(message.stats as BeybladeStats);
+        if (message.launch) {
+            multiplayer.remoteLaunchRequested = true;
+            if (hasLaunched) launchEntity(enemy, multiplayer.remoteLaunchAngle);
+        }
+        return;
+    }
+
+    if (message.type === 'reset') {
+        clearWinnerOverlay();
+        resetMatch();
+    }
+}
+
+function bindMultiplayerConnection(conn: DataConnection) {
+    multiplayer.conn = conn;
+    conn.on('open', () => {
+        setMultiplayerStatus('Connected');
+        sendMultiplayerMessage({ type: 'hello', stats: cloneStats(PLAYER_STATS), name: 'Player' });
+        if (multiplayer.localReady) sendMultiplayerReady();
+    });
+    conn.on('data', handleMultiplayerMessage);
+    conn.on('close', () => setMultiplayerStatus('Disconnected'));
+    conn.on('error', () => setMultiplayerStatus('Error'));
+}
+
+function startMultiplayerHost() {
+    cleanupMultiplayer();
+    multiplayer.role = 'host';
+    syncOpponentHudLabel();
+    setMultiplayerStatus('Hosting');
+    const peer = new Peer(getPeerOptions());
+    multiplayer.peer = peer;
+    peer.on('open', (id) => {
+        multiplayer.peerId = id;
+        multiplayer.joinLink = createJoinLink(id);
+        setMultiplayerStatus('Hosting');
+    });
+    peer.on('connection', (conn) => {
+        multiplayer.conn?.close();
+        bindMultiplayerConnection(conn);
+    });
+    peer.on('error', () => setMultiplayerStatus('Error'));
+}
+
+function joinMultiplayerHost(hostPeerId: string) {
+    if (!hostPeerId.trim()) return;
+    cleanupMultiplayer();
+    multiplayer.role = 'guest';
+    syncOpponentHudLabel();
+    setMultiplayerStatus('Joining');
+    const peer = new Peer(getPeerOptions());
+    multiplayer.peer = peer;
+    peer.on('open', () => {
+        const conn = peer.connect(hostPeerId.trim(), { reliable: true });
+        bindMultiplayerConnection(conn);
+    });
+    peer.on('error', () => setMultiplayerStatus('Error'));
+}
+
+function autoJoinFromUrl() {
+    const peerId = new URLSearchParams(window.location.search).get('joinPeer');
+    if (peerId) joinMultiplayerHost(peerId);
+}
+
+function getPeerIdFromInput(rawValue: string) {
+    try {
+        return new URL(rawValue).searchParams.get('joinPeer') || rawValue;
+    } catch {
+        return rawValue;
+    }
+}
+
+function showOnlineDialog() {
+    if (document.querySelector('.online-overlay')) return;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'tutorial-overlay online-overlay';
+    overlay.innerHTML = `
+        <div class="tutorial-panel menu-panel">
+            <span class="kicker">Online</span>
+            <h1>Lobby</h1>
+            <div class="multiplayer-lobby-grid">
+                <section class="multiplayer-card">
+                    <div class="multiplayer-card-head">
+                        <span>Host</span>
+                        <div class="multiplayer-status">${getMultiplayerStatusText()}</div>
+                    </div>
+                    <div class="multiplayer-card-body">
+                        <input class="multiplayer-link" id="online-host-link" readonly value="${multiplayer.joinLink}" placeholder="Host link appears here">
+                        <button class="action-btn save" id="online-host-match">Host</button>
+                    </div>
+                </section>
+                <section class="multiplayer-card">
+                    <div class="multiplayer-card-head">
+                        <span>Join</span>
+                    </div>
+                    <div class="multiplayer-card-body multiplayer-join-row">
+                        <input id="online-peer-id" placeholder="Paste host peer id or join URL">
+                        <button class="action-btn save" id="online-join-match">Join</button>
+                    </div>
+                </section>
+            </div>
+            <div class="tutorial-actions">
+                <button class="action-btn reset" id="online-back">Back</button>
+                <button class="action-btn save" id="online-close">Done</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+
+    overlay.querySelector('#online-host-match')?.addEventListener('click', () => {
+        localPlayMode = '1p';
+        startMultiplayerHost();
+    });
+    overlay.querySelector('#online-join-match')?.addEventListener('click', () => {
+        const rawValue = overlay.querySelector<HTMLInputElement>('#online-peer-id')?.value.trim() || '';
+        localPlayMode = '1p';
+        joinMultiplayerHost(getPeerIdFromInput(rawValue));
+    });
+    overlay.querySelector<HTMLInputElement>('#online-host-link')?.addEventListener('click', async (event) => {
+        const input = event.currentTarget as HTMLInputElement;
+        input.select();
+        if (input.value && navigator.clipboard) {
+            await navigator.clipboard.writeText(input.value);
+        }
+    });
+    overlay.querySelector('#online-back')?.addEventListener('click', () => {
+        overlay.remove();
+        showMenuDialog();
+    });
+    overlay.querySelector('#online-close')?.addEventListener('click', () => overlay.remove());
+}
+
 function showMenuDialog() {
     if (document.querySelector('.menu-overlay')) return;
 
@@ -3322,18 +4112,31 @@ function showMenuDialog() {
                     <span>Sound</span>
                     <input id="menu-volume" type="range" min="0" max="1" step="0.01" value="${masterVolume}">
                 </label>
-                <label class="menu-option menu-option-inline">
-                    <span>Flashes</span>
-                    <input id="menu-flashes" type="checkbox" ${flashesEnabled ? 'checked' : ''}>
-                </label>
+                <div class="menu-option menu-effects-row">
+                    <span>Effects</span>
+                    <div class="menu-toggle-grid">
+                        <label class="menu-toggle-option">
+                            <span>Flashes</span>
+                            <input id="menu-flashes" type="checkbox" ${flashesEnabled ? 'checked' : ''}>
+                        </label>
+                        <label class="menu-toggle-option">
+                            <span>Shake</span>
+                            <input id="menu-camera-shake" type="checkbox" ${cameraShakeEnabled ? 'checked' : ''}>
+                        </label>
+                    </div>
+                </div>
                 <div class="menu-option">
                     <span>Game speed</span>
                     <div class="menu-speed-grid">${speedOptions}</div>
                 </div>
             </div>
-            <div class="tutorial-actions">
+            <div class="tutorial-actions mode-actions menu-play-modes">
+                <button class="action-btn save" id="menu-1p">1P</button>
+                <button class="action-btn save" id="menu-2p">2P</button>
+                <button class="action-btn save" id="menu-online">Online</button>
+            </div>
+            <div class="tutorial-actions menu-how-to-play">
                 <button class="action-btn reset" id="menu-tutorial">How to play</button>
-                <button class="action-btn save" id="menu-start">Play</button>
             </div>
         </div>
     `;
@@ -3348,6 +4151,9 @@ function showMenuDialog() {
     overlay.querySelector<HTMLInputElement>('#menu-flashes')?.addEventListener('change', (event) => {
         setFlashesEnabled((event.target as HTMLInputElement).checked);
     });
+    overlay.querySelector<HTMLInputElement>('#menu-camera-shake')?.addEventListener('change', (event) => {
+        setCameraShakeEnabled((event.target as HTMLInputElement).checked);
+    });
     overlay.querySelectorAll<HTMLInputElement>('input[name="menu-speed"]').forEach((input) => {
         input.addEventListener('change', () => {
             if (!isGameSpeedId(input.value)) return;
@@ -3356,8 +4162,7 @@ function showMenuDialog() {
             input.closest('.menu-speed-option')?.classList.add('active');
         });
     });
-
-    overlay.querySelector('#menu-start')?.addEventListener('click', () => {
+    const closeForMode = () => {
         tutorialModeActive = false;
         tutorialPauseActive = false;
         tutorialSlowMoActive = false;
@@ -3365,6 +4170,18 @@ function showMenuDialog() {
         clearTutorialInstruction();
         clearTutorialWarning();
         overlay.remove();
+    };
+    overlay.querySelector('#menu-1p')?.addEventListener('click', () => {
+        closeForMode();
+        setLocalPlayMode('1p');
+    });
+    overlay.querySelector('#menu-2p')?.addEventListener('click', () => {
+        closeForMode();
+        setLocalPlayMode('2p');
+    });
+    overlay.querySelector('#menu-online')?.addEventListener('click', () => {
+        overlay.remove();
+        showOnlineDialog();
     });
     overlay.querySelector('#menu-tutorial')?.addEventListener('click', () => {
         overlay.remove();
@@ -3374,6 +4191,7 @@ function showMenuDialog() {
 
 topMenuBtn.onclick = showMenuDialog;
 showMenuDialog();
+autoJoinFromUrl();
 
 animate();
 
@@ -3401,63 +4219,27 @@ launchBtn.addEventListener('click', () => {
     }
     ensureBeyNoiseLayers();
 
-    resetMatchCounters();
-    hasLaunched = true;
-    if (tutorialModeActive && tutorialPhase === 'launch') {
-        clearTutorialInstruction();
-        tutorialPhase = 'waitingDiveMoment';
-        tutorialNextPromptAt = clock.getElapsedTime() + 2.4;
-    }
-    setCpuPattern(0);
-    scheduleNextCpuDiveSwitch(clock.getElapsedTime() + 0.5);
-
-    // Player Launch
-    const angleRad = (currentLaunchAngle.value * Math.PI) / 180;
-
-    // Use player stats for speed
-    const launchSpeed = player.stats ? player.stats.spd : 200;
-
-    // Matter.js velocity
-    const vx = Math.cos(angleRad) * launchSpeed * 0.1;
-    const vy = Math.sin(angleRad) * launchSpeed * 0.1;
-
-    Body.setVelocity(player.body, { x: vx, y: vy });
-
-    // Initialize Player HP (RPM)
-    if (player.stats) {
-        player.currentRpm = player.stats.maxRpm;
-        // visual spin speed (rad/s approx rpm/100)
-        Body.setAngularVelocity(player.body, player.currentRpm / 100);
-    } else {
-        Body.setAngularVelocity(player.body, 50); // Fallback
+    if (multiplayer.role !== 'solo') {
+        markLocalMultiplayerReady();
+        return;
     }
 
-    // Enemy Launch (Random Angle, Max Power)
-    const enemyAngle = Math.random() * Math.PI * 2;
-    const enemySpeed = enemy.stats ? enemy.stats.spd : 200;
-    const enemyVx = Math.cos(enemyAngle) * enemySpeed * 0.1;
-    const enemyVy = Math.sin(enemyAngle) * enemySpeed * 0.1;
+    if (localPlayMode === '2p' && multiplayer.role === 'solo') {
+        if (twoPlayerLaunchStep === 'p1') {
+            twoPlayerLaunchAngles.p1 = currentLaunchAngle.value;
+            twoPlayerLaunchStep = 'p2';
+            currentLaunchAngle.value = (twoPlayerLaunchAngles.p1 + 180) % 360;
+            updateGuide(currentLaunchAngle.value);
+            syncLaunchSetupUi();
+            return;
+        }
 
-    Body.setVelocity(enemy.body, { x: enemyVx, y: enemyVy });
-
-    // Initialize Enemy HP (RPM)
-    if (enemy.stats) {
-        enemy.currentRpm = enemy.stats.maxRpm;
-        Body.setAngularVelocity(enemy.body, enemy.currentRpm / 100);
-    } else {
-        Body.setAngularVelocity(enemy.body, 50);
+        twoPlayerLaunchAngles.p2 = currentLaunchAngle.value;
+        startTwoPlayerLaunchCountdown();
+        return;
     }
 
-    // Save stats snapshot at match start (for "Keep Power-Ups" reset)
-    matchStartPlayerStats = JSON.parse(JSON.stringify(player.stats));
-    matchStartEnemyStats = JSON.parse(JSON.stringify(enemy.stats));
-
-    // Hide UI handled in animate loop or here
-    launchContainer.style.display = 'none';
-    cycleBtnContainer.style.display = 'flex'; // Show Pattern Button
-
-    // Update action HUD buttons
-    resetHint.style.display = 'block';
+    startLocalSimulatedMatch(currentLaunchAngle.value);
 });
 
 // Window Resize Handling
@@ -3499,6 +4281,7 @@ function showWinner(text: string, accentColor = 0xf7cf2e) {
 
     const stats = document.createElement('div');
     stats.className = 'winner-stats';
+    const opponentLabel = getOpponentLabel();
     stats.innerHTML = `
         <div class="winner-stats-row">
             <span>P1</span>
@@ -3506,7 +4289,7 @@ function showWinner(text: string, accentColor = 0xf7cf2e) {
             <span><strong>${matchCounters.player.wallDings}</strong> DNG</span>
         </div>
         <div class="winner-stats-row">
-            <span>CPU</span>
+            <span>${opponentLabel}</span>
             <span><strong>${matchCounters.enemy.criticalHits}</strong> CRT</span>
             <span><strong>${matchCounters.enemy.wallDings}</strong> DNG</span>
         </div>
@@ -3518,7 +4301,7 @@ function showWinner(text: string, accentColor = 0xf7cf2e) {
     rematchBtn.innerText = 'REMATCH';
     rematchBtn.onclick = () => {
         document.body.removeChild(overlay);
-        resetMatch();
+        requestMatchReset();
     };
     overlay.appendChild(rematchBtn);
 
@@ -3580,12 +4363,24 @@ const resetEntityVisualsAndPhysics = (entity: GameEntity, stats: BeybladeStats, 
 function resetMatch() {
     hasLaunched = false;
     gameOver = false;
+    clearLaunchCountdown();
     resetMatchCounters();
+    multiplayer.localReady = false;
+    multiplayer.remoteReady = false;
+    multiplayer.localLaunchAngle = DEFAULT_LAUNCH_ANGLE;
+    multiplayer.remoteLaunchRequested = false;
+    multiplayer.remoteLaunchAngle = DEFAULT_LAUNCH_ANGLE;
+    resetMultiplayerDiveQueue();
+    twoPlayerLaunchStep = 'p1';
+    twoPlayerLaunchAngles = { p1: DEFAULT_LAUNCH_ANGLE, p2: 0 };
+    localDiveIntent = 0;
+    cpuDiveIntent = 0;
 
     // Update action HUD buttons
     resetHint.style.display = 'none';
     cycleBtnContainer.style.display = 'none'; // Hide Pattern Button
-    setPattern(null, 0);
+    cpuCycleBtnContainer.style.display = 'none';
+    applyPlayerDivePattern(0);
     setCpuPattern(0);
     scheduleNextCpuDiveSwitch(clock.getElapsedTime());
 
@@ -3620,6 +4415,18 @@ function resetMatch() {
     currentLaunchAngle.value = DEFAULT_LAUNCH_ANGLE;
     updateGuide(currentLaunchAngle.value);
     guideMesh.visible = true;
+    syncLaunchSetupUi();
+    syncHudButtonColors();
+}
+
+function clearWinnerOverlay() {
+    document.querySelectorAll('.winner-overlay').forEach((overlay) => overlay.remove());
+}
+
+function requestMatchReset() {
+    clearWinnerOverlay();
+    sendMultiplayerReset();
+    resetMatch();
 }
 
 // showResetDialog removed
@@ -3628,10 +4435,6 @@ function resetMatch() {
 // Reset Key
 window.addEventListener('keydown', (e) => {
     if (e.key === 'r' || e.key === 'R') {
-        const overlay = document.querySelector('.winner-overlay');
-        if (overlay && overlay.parentNode) {
-            overlay.parentNode.removeChild(overlay);
-        }
-        resetMatch();
+        requestMatchReset();
     }
 });

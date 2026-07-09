@@ -176,14 +176,31 @@ button:disabled {
 }
 
 .rpm-label {
+  --bey-trail-color: var(--coin);
   min-width: 58px;
   min-height: 34px;
   padding: 0 10px;
-  color: var(--ink);
-  background: var(--coin);
-  border-color: var(--coin);
+  color: #111;
+  background: var(--bey-trail-color);
+  border-color: var(--bey-trail-color);
   box-shadow: none;
   font-size: 0.78rem;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.rpm-label:hover {
+  color: #111;
+  background: var(--bey-trail-color);
+  border-color: #fff;
+}
+
+.rpm-label:disabled {
+  cursor: default;
+  opacity: 0.86;
+  color: #111;
+  background: color-mix(in srgb, var(--bey-trail-color) 72%, #222);
+  border-color: color-mix(in srgb, var(--bey-trail-color) 72%, #222);
+  box-shadow: none;
 }
 
 .rpm-meter-wrap {
@@ -356,15 +373,36 @@ button:disabled {
   font-size: 0.92rem;
 }
 
+.launch-countdown-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.16);
+  pointer-events: none;
+}
+
+.launch-countdown-text {
+  color: #fff;
+  font-size: clamp(4rem, 16vw, 9rem);
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: 0;
+  text-shadow: 0 0 28px rgba(255, 255, 255, 0.35), 4px 4px 0 #111;
+  text-transform: uppercase;
+}
+
 /* In-match controls */
 .action-hud {
   position: fixed;
-  right: max(16px, env(safe-area-inset-right));
+  left: 50%;
   bottom: max(16px, env(safe-area-inset-bottom));
   z-index: 100;
   display: flex;
   gap: 8px;
   pointer-events: auto;
+  transform: translateX(-50%);
 }
 
 .action-hud-btn {
@@ -381,6 +419,11 @@ button:disabled {
   z-index: 100;
   display: flex;
   pointer-events: auto;
+}
+
+.cpu-cycle-container {
+  right: max(16px, env(safe-area-inset-right));
+  left: auto;
 }
 
 .pattern-btn {
@@ -535,14 +578,8 @@ button:disabled {
 }
 
 .tutorial-game-message::after {
-  content: "";
-  position: absolute;
-  width: 12px;
-  height: 12px;
-  border-right: 1px solid rgba(255, 246, 231, 0.3);
-  border-bottom: 1px solid rgba(255, 246, 231, 0.3);
-  background: rgba(17, 17, 17, 0.94);
-  transform: rotate(45deg);
+  content: none;
+  display: none;
 }
 
 .tutorial-game-message[data-arrow^="bottom"]::after {
@@ -732,6 +769,43 @@ button:disabled {
   accent-color: var(--cyan);
 }
 
+.menu-toggle-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.menu-toggle-option {
+  min-width: 0;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 246, 231, 0.24);
+  border-radius: 4px;
+  background: #111;
+}
+
+.menu-toggle-option span {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 0.68rem;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.menu-toggle-option input {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  accent-color: var(--cyan);
+}
+
 #menu-volume {
   width: 100%;
   accent-color: var(--cyan);
@@ -771,8 +845,104 @@ button:disabled {
   color: #111;
 }
 
+.multiplayer-menu {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.multiplayer-lobby-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 18px 0;
+}
+
+.multiplayer-card {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(255, 246, 231, 0.28);
+  border-radius: 4px;
+  background: rgba(255, 246, 231, 0.05);
+}
+
+.multiplayer-card-head {
+  min-width: 0;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.multiplayer-card-head > span {
+  color: var(--text);
+  font-size: 0.72rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.multiplayer-card-body {
+  min-width: 0;
+  display: grid;
+  align-content: end;
+  gap: 8px;
+}
+
+.multiplayer-status {
+  min-height: 28px;
+  display: grid;
+  align-items: center;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 246, 231, 0.28);
+  border-radius: 4px;
+  background: #111;
+  color: var(--cyan);
+  font-size: 0.7rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.multiplayer-actions,
+.multiplayer-join-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+}
+
+.multiplayer-join-row .action-btn {
+  min-width: 86px;
+}
+
+.multiplayer-link,
+.multiplayer-join-row input {
+  min-width: 0;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 246, 231, 0.34);
+  border-radius: 4px;
+  background: #111;
+  color: var(--text);
+  font-size: 0.68rem;
+  font-weight: 800;
+}
+
 .menu-panel .tutorial-actions {
   grid-template-columns: 1fr 1fr;
+}
+
+.menu-panel .mode-actions {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.menu-panel .menu-how-to-play {
+  grid-template-columns: 1fr;
+  margin-top: 10px;
 }
 
 .tutorial-phase-panel .tutorial-actions {
@@ -1448,6 +1618,11 @@ dialog.visual-customization-dialog::backdrop {
     left: max(10px, env(safe-area-inset-left));
   }
 
+  .cpu-cycle-container {
+    right: max(10px, env(safe-area-inset-right));
+    left: auto;
+  }
+
   .pattern-btn {
     width: 68px;
     height: 68px;
@@ -1455,7 +1630,6 @@ dialog.visual-customization-dialog::backdrop {
   }
 
   .action-hud {
-    right: max(10px, env(safe-area-inset-right));
     bottom: max(10px, env(safe-area-inset-bottom));
   }
 
@@ -1482,13 +1656,21 @@ dialog.visual-customization-dialog::backdrop {
     grid-template-columns: 1fr;
   }
 
+  .menu-panel .mode-actions {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .multiplayer-lobby-grid {
+    grid-template-columns: 1fr;
+  }
+
   .menu-option {
     grid-template-columns: 1fr;
     gap: 8px;
   }
 
   .menu-speed-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   dialog.stat-editor-dialog {
