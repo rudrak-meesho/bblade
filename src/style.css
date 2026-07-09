@@ -171,6 +171,10 @@ button:disabled {
   transform: translateY(1px);
 }
 
+.top-menu-btn:active {
+  transform: translateX(-50%) translateY(1px);
+}
+
 .rpm-label {
   min-width: 58px;
   min-height: 34px;
