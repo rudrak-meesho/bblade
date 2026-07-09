@@ -136,12 +136,18 @@ document.body.appendChild(launchContainer);
 
 
 const DEFAULT_LAUNCH_ANGLE = 180;
+const TUTORIAL_MIN_AIM_DELTA = 18;
 const currentLaunchAngle = { value: DEFAULT_LAUNCH_ANGLE };
 let twoPlayerLaunchStep: 'p1' | 'p2' = 'p1';
 let twoPlayerLaunchAngles = { p1: DEFAULT_LAUNCH_ANGLE, p2: 0 };
 let launchCountdownOverlay: HTMLElement | null = null;
 let launchCountdownInterval: number | undefined;
 let launchCountdownComplete: (() => void) | null = null;
+
+function getAngleDelta(a: number, b: number) {
+    const delta = Math.abs(((a - b + 540) % 360) - 180);
+    return delta;
+}
 
 // -- Linear Slider --
 // -- Pointer Lock Drag Zone --
@@ -1008,6 +1014,18 @@ type TMatchCounters = {
     enemy: TMatchCounterSide;
 };
 
+type TCriticalHitReport = {
+    crit: number;
+    def: number;
+    dmg: number;
+    rpmLost: number;
+};
+
+type TWallHitReport = {
+    dmg: number;
+    rpmLost: number;
+};
+
 const matchCounters: TMatchCounters = {
     player: { criticalHits: 0, wallDings: 0 },
     enemy: { criticalHits: 0, wallDings: 0 }
@@ -1608,6 +1626,7 @@ let tutorialPromptEl: HTMLElement | null = null;
 let tutorialWarningEl: HTMLElement | null = null;
 let tutorialWarningTimeout: number | undefined;
 let tutorialLastWallWarningAt = -Infinity;
+let tutorialInitialAimAngle = DEFAULT_LAUNCH_ANGLE;
 let tutorialHighlightEl: HTMLElement | null = null;
 let tutorialLayerEl: HTMLElement | null = null;
 
@@ -2275,9 +2294,12 @@ Events.on(engine, 'collisionStart', (event) => {
             const isCritA = speedA > CRIT_SPEED_THRESHOLD;
             const rawDmgA = isCritA ? entityA.stats.crtAtk : entityA.stats.atk;
             const finalDmgA = Math.max(0, rawDmgA - entityB.stats.def);
+            let rpmLostByB = 0;
 
             if (entityB.currentRpm !== undefined) {
+                const rpmBefore = entityB.currentRpm;
                 entityB.currentRpm = Math.max(0, entityB.currentRpm - finalDmgA);
+                rpmLostByB = rpmBefore - entityB.currentRpm;
             }
 
             // B hits A
@@ -2285,9 +2307,12 @@ Events.on(engine, 'collisionStart', (event) => {
             const isCritB = speedB > CRIT_SPEED_THRESHOLD;
             const rawDmgB = isCritB ? entityB.stats.crtAtk : entityB.stats.atk;
             const finalDmgB = Math.max(0, rawDmgB - entityA.stats.def);
+            let rpmLostByA = 0;
 
             if (entityA.currentRpm !== undefined) {
+                const rpmBefore = entityA.currentRpm;
                 entityA.currentRpm = Math.max(0, entityA.currentRpm - finalDmgB);
+                rpmLostByA = rpmBefore - entityA.currentRpm;
             }
 
 
@@ -2317,8 +2342,18 @@ Events.on(engine, 'collisionStart', (event) => {
             }
             if (isHighSpeed) {
                 triggerCriticalFeedback(criticalFlashPoint);
-                if (isCritA) notifyTutorialCriticalHit(entityA);
-                if (isCritB) notifyTutorialCriticalHit(entityB);
+                if (isCritA) notifyTutorialCriticalHit(entityA, {
+                    crit: entityA.stats.crtAtk,
+                    def: entityB.stats.def,
+                    dmg: finalDmgA,
+                    rpmLost: rpmLostByB
+                });
+                if (isCritB) notifyTutorialCriticalHit(entityB, {
+                    crit: entityB.stats.crtAtk,
+                    def: entityA.stats.def,
+                    dmg: finalDmgB,
+                    rpmLost: rpmLostByA
+                });
                 playCollisionSound(0.34, 675, true);
             } else {
                 playCollisionSound(0.2, 200); // Normal Pitch
@@ -2328,18 +2363,24 @@ Events.on(engine, 'collisionStart', (event) => {
             // If one is a Beyblade and the other is not (Environment), apply Barrier Damage
             if (entityA && !entityB) {
                 // A hit a wall
+                let rpmLost = 0;
                 if (entityA.currentRpm !== undefined) {
+                    const rpmBefore = entityA.currentRpm;
                     entityA.currentRpm = Math.max(0, entityA.currentRpm - BARRIER_DAMAGE);
+                    rpmLost = rpmBefore - entityA.currentRpm;
                 }
                 getMatchCounterSide(entityA)!.wallDings += 1;
-                notifyTutorialWallHit(entityA);
+                notifyTutorialWallHit(entityA, { dmg: BARRIER_DAMAGE, rpmLost });
             } else if (entityB && !entityA) {
                 // B hit a wall
+                let rpmLost = 0;
                 if (entityB.currentRpm !== undefined) {
+                    const rpmBefore = entityB.currentRpm;
                     entityB.currentRpm = Math.max(0, entityB.currentRpm - BARRIER_DAMAGE);
+                    rpmLost = rpmBefore - entityB.currentRpm;
                 }
                 getMatchCounterSide(entityB)!.wallDings += 1;
-                notifyTutorialWallHit(entityB);
+                notifyTutorialWallHit(entityB, { dmg: BARRIER_DAMAGE, rpmLost });
             }
 
             if (pair.collision.supports.length > 0) {
@@ -2356,7 +2397,25 @@ Events.on(engine, 'collisionStart', (event) => {
 
 
 // --- Game Loop ---
-const SUBSTEPS = 8;
+type TNavigatorWithDeviceMemory = Navigator & { deviceMemory?: number };
+
+function shouldUseReducedPhysicsWork() {
+    const nav = navigator as TNavigatorWithDeviceMemory;
+    const cores = nav.hardwareConcurrency || 4;
+    const memory = nav.deviceMemory;
+    const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+    const compactScreen = Math.min(window.innerWidth, window.innerHeight) < 820;
+    return cores <= 4 || (memory !== undefined && memory <= 4) || (coarsePointer && compactScreen);
+}
+
+const REDUCED_PHYSICS_WORK = shouldUseReducedPhysicsWork();
+
+function getPhysicsSubsteps(speedMultiplier: number) {
+    if (speedMultiplier <= 0.35) return REDUCED_PHYSICS_WORK ? 2 : 3;
+    if (speedMultiplier >= 1.75) return REDUCED_PHYSICS_WORK ? 3 : 4;
+    return REDUCED_PHYSICS_WORK ? 3 : 4;
+}
+
 let frameCounter = 0;
 
 
@@ -2366,9 +2425,10 @@ function animate() {
     // Physics Update
     const simulationPaused = tutorialPauseActive;
     const speedMultiplier = GAME_SPEEDS[currentGameSpeed].multiplier * (tutorialSlowMoActive ? 0.28 : 1);
-    const subStepDelta = simulationPaused ? 0 : ((1000 / 60) * speedMultiplier) / SUBSTEPS;
+    const physicsSubsteps = simulationPaused ? 0 : getPhysicsSubsteps(speedMultiplier);
+    const subStepDelta = physicsSubsteps > 0 ? ((1000 / 60) * speedMultiplier) / physicsSubsteps : 0;
     if (!simulationPaused) updateCpuDive(clock.getElapsedTime());
-    for (let i = 0; i < SUBSTEPS && !simulationPaused; i++) {
+    for (let i = 0; i < physicsSubsteps && !simulationPaused; i++) {
         processScheduledDiveEvents();
         Engine.update(engine, subStepDelta);
 
@@ -2573,7 +2633,7 @@ function animate() {
         if (entity.stats && entity.currentRpm !== undefined) {
             // Stamina Decay
             // Lose STA per second
-            const decay = entity.stats.sta * (subStepDelta / 1000) * SUBSTEPS;
+            const decay = entity.stats.sta * (subStepDelta / 1000) * physicsSubsteps;
             if (entity.currentRpm > 0) {
                 entity.currentRpm = Math.max(0, entity.currentRpm - decay);
             }
@@ -3482,9 +3542,10 @@ function startTutorialMode() {
     tutorialSlowMoActive = false;
     tutorialPhase = 'aim';
     tutorialNextPromptAt = 0;
+    tutorialInitialAimAngle = currentLaunchAngle.value;
     showTutorialInstruction(
         'Adjust launch angle',
-        'Drag AIM left or right. Release when the opening path feels right.',
+        `Drag AIM left or right until the angle clearly changes. Release after at least ${TUTORIAL_MIN_AIM_DELTA} degrees of movement.`,
         dragZone,
         launchContainer,
         true,
@@ -3494,10 +3555,22 @@ function startTutorialMode() {
 
 function handleTutorialAimComplete() {
     if (!tutorialModeActive || tutorialPhase !== 'aim') return;
+    const aimDelta = getAngleDelta(currentLaunchAngle.value, tutorialInitialAimAngle);
+    if (aimDelta < TUTORIAL_MIN_AIM_DELTA) {
+        showTutorialInstruction(
+            'Drag AIM farther',
+            `Move the AIM bar until the launch angle changes by at least ${TUTORIAL_MIN_AIM_DELTA} degrees. A tiny tap does not set the path.`,
+            dragZone,
+            launchContainer,
+            true,
+            'middle'
+        );
+        return;
+    }
     tutorialPhase = 'launch';
     showTutorialInstruction(
         'Press Launch',
-        'Send your bey into the stadium. The lesson will slow down when DIVE matters.',
+        'Send your bey into the stadium. The lesson will slow down when "DIVE" matters.',
         launchBtn,
         launchContainer,
         true,
@@ -3511,20 +3584,23 @@ function handleTutorialDivePressed() {
     tutorialPhase = 'gainSpeed';
     tutorialNextPromptAt = clock.getElapsedTime() + 1.1;
     showTutorialInstruction(
-        'Control DIVE',
-        'Use short DIVE bursts to gain speed. Sparks mean your bey is ready for bonus damage.',
+        'Control "DIVE"',
+        'Use short "DIVE" bursts to gain speed. Sparks mean your bey is ready for bonus damage.',
         cycleBtn,
         cycleBtnContainer,
         false
     );
 }
 
-function notifyTutorialCriticalHit(entity: GameEntity) {
+function notifyTutorialCriticalHit(entity: GameEntity, report?: TCriticalHitReport) {
     if (!tutorialModeActive || entity !== player || tutorialPhase !== 'waitingCrit') return;
     tutorialPhase = 'finishModal';
+    const damageCopy = report
+        ? `CRIT ${Math.round(report.crit)} - DEF ${Math.round(report.def)} = ${Math.round(report.dmg)} DMG. CPU lost ${Math.round(report.rpmLost)} RPM.`
+        : 'That flash means your fast hit connected. Critical hits deal bonus damage.';
     showTutorialCheckpoint(
         'Critical hit landed',
-        'That flash means your fast hit connected. Critical hits deal bonus damage.',
+        `That flash means your fast hit connected. ${damageCopy}`,
         'Continue',
         () => {
             tutorialPhase = 'finishModal';
@@ -3535,7 +3611,7 @@ function notifyTutorialCriticalHit(entity: GameEntity) {
     );
 }
 
-function notifyTutorialWallHit(entity: GameEntity) {
+function notifyTutorialWallHit(entity: GameEntity, report?: TWallHitReport) {
     if (!tutorialModeActive || tutorialPauseActive || gameOver || entity !== player) return;
     if (tutorialPhase === 'idle' || tutorialPhase === 'aim' || tutorialPhase === 'launch' || tutorialPhase === 'complete') return;
 
@@ -3545,7 +3621,9 @@ function notifyTutorialWallHit(entity: GameEntity) {
 
     showTutorialWarning(
         'Wall hit',
-        'Bumping the stadium wall drains RPM. Use shorter DIVE bursts and curve back before the rim.',
+        report
+            ? `Wall DMG ${Math.round(report.dmg)}. Your bey lost ${Math.round(report.rpmLost)} RPM. Use shorter "DIVE" bursts and curve back before the rim.`
+            : 'Bumping the stadium wall drains RPM. Use shorter "DIVE" bursts and curve back before the rim.',
         cycleBtn,
         'end'
     );
@@ -3564,8 +3642,8 @@ function updateTutorialFlow(now: number) {
             tutorialPhase = 'dive';
             tutorialSlowMoActive = true;
             showTutorialInstruction(
-                'Hold DIVE now',
-                'Your bey is wide while CPU is near center. Dive inward to turn speed into the hit.',
+                'Hold "DIVE" now',
+                'Your bey is wide while CPU is near center. Hold the "DIVE" button, or press the A key, to dive inward.',
                 cycleBtn,
                 cycleBtnContainer
             );
@@ -3582,13 +3660,13 @@ function updateTutorialFlow(now: number) {
     if (tutorialPhase === 'speedModal' && now >= tutorialNextPromptAt) {
         showTutorialCheckpoint(
             'Speed gained',
-            'Your bey has gained speed. Hitting the opponent in this state deals extra damage.',
+            'Your bey has gained speed. Notice the SPARKLES: hitting the opponent in this state deals extra damage.',
             'Go for criticals',
             () => {
                 tutorialPhase = 'waitingCrit';
                 showTutorialInstruction(
                     'Land the hit',
-                    'Keep controlling DIVE and collide while fast. Critical hits flash and hit harder.',
+                    'Keep controlling "DIVE" and collide while fast. Critical hits flash and hit harder.',
                     cycleBtn,
                     cycleBtnContainer,
                     false
@@ -4285,8 +4363,8 @@ launchBtn.addEventListener('click', () => {
     if (hasLaunched) return;
     if (tutorialModeActive && tutorialPhase === 'aim') {
         showTutorialInstruction(
-            'Adjust launch angle',
-            'Drag AIM left or right first. Release when the opening path feels right.',
+            'Drag AIM farther',
+            `Drag AIM left or right until the angle changes by at least ${TUTORIAL_MIN_AIM_DELTA} degrees, then release.`,
             dragZone,
             launchContainer,
             true,
