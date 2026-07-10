@@ -1,10 +1,18 @@
+import { inject } from '@vercel/analytics';
 
 import Matter from 'matter-js';
 import Peer, { type DataConnection, type PeerOptions } from 'peerjs';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+
 import "./style.css";
+
+// Initialize Vercel Analytics with configuration
+inject({
+  mode: import.meta.env.MODE === 'production' ? 'production' : 'development',
+  debug: import.meta.env.MODE !== 'production'
+});
 
 // --- Physics Setup (Matter.js) ---
 const Engine = Matter.Engine;
